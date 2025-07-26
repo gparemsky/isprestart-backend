@@ -22,6 +22,16 @@ import (
 	"net/http"
 )
 
+type ISPState struct {
+	ISPID                  int
+	PowerState             bool
+	UxtimeWhenOffRequested int64
+	OffUntilUxtimesec      int64
+}
+
+var ispPrimaryState bool = true
+var ispSecondaryState bool = true
+
 var DOW = map[string]int{
 	"monday":    1,
 	"tuesday":   2,
@@ -76,6 +86,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+	go startGPIOlogic(db)
+
 	pingChannel := make(chan map[string]int)
 	go pingTest(pingChannel)             // start pinging
 	go PrintPingResults(db, pingChannel) // save ping results to db
@@ -87,6 +99,66 @@ func main() {
 	http.ListenAndServe(":8081", nil)
 
 	select {} // keep the program running
+}
+
+func startGPIOlogic(db *sql.DB) {
+	// query the database for the ispstates table
+	// check the table for any amount of rows, if it has more than 0 rows, then retrieve the values
+	// if it has 0 rows, then insert the default values
+	var count int
+
+	primaryISPState := ISPState{}
+	secondaryISPState := ISPState{}
+
+	err := db.QueryRow("SELECT COUNT(*) FROM ispstates").Scan(&count)
+	if err != nil {
+		fmt.Println(err)
+		fmt.Println("Error counting rows in ispstates table:", err)
+		return
+	}
+
+	if count == 0 {
+		//"Table is empty" - lets populate it with default values
+		for isp := range 2 {
+			fmt.Printf("Table is empty, inserting default values for isp %d\n", isp)
+			stmt, err := db.Prepare("INSERT INTO ispstates (ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec) VALUES (?, ?, ?, ?)")
+			if err != nil {
+				fmt.Println("Error preparing statement for isp", isp, ":", err)
+				log.Fatal(err)
+			}
+			defer stmt.Close()
+
+			_, err = stmt.Exec(isp, 1, 0, 0) //isp 0 is primary, 1 is secondary, power state is always on by default- times are populated when restart button is pressed
+			if err != nil {
+				fmt.Println("Error inserting default values for isp", isp, ":", err)
+				log.Fatal(err)
+			}
+		}
+	}
+
+	for {
+		fmt.Println(count)
+		if count > 0 { //"Table is not empty" - lets retrieve the values
+			for isp := range 2 {
+				if isp == 0 {
+					var err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").Scan(&primaryISPState.ISPID, &primaryISPState.PowerState, &primaryISPState.UxtimeWhenOffRequested, &primaryISPState.OffUntilUxtimesec)
+					if err != nil {
+						fmt.Println("Error retrieving values for primary isp:", err)
+						log.Fatal(err)
+					}
+				} else if isp == 1 {
+					var err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").Scan(&secondaryISPState.ISPID, &secondaryISPState.PowerState, &secondaryISPState.UxtimeWhenOffRequested, &secondaryISPState.OffUntilUxtimesec)
+					if err != nil {
+						fmt.Println("Error retrieving values for secondary isp:", err)
+						log.Fatal(err)
+					}
+				}
+			}
+		}
+		time.Sleep(5 * time.Second) // sleep for 10 seconds before checking again
+		fmt.Println("Primary ISP State:", primaryISPState)
+		fmt.Println("Secondary ISP State:", secondaryISPState)
+	}
 }
 
 func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im not sure if this is a bad idea
@@ -317,7 +389,17 @@ func createTables(db *sql.DB) error {
         );
     `)
 
-	for _, err := range []error{err, err1, err2} {
+	//isp 0 is primary, isp 1 is secondary
+	_, err3 := db.Exec(`
+		CREATE TABLE IF NOT EXISTS ispstates (
+		    ispid TINYINT PRIMARY KEY,
+		    powerstate TINYINT NOT NULL,
+		    uxtimewhenoffrequested INTEGER NOT NULL,
+		    offuntiluxtimesec INTEGER NOT NULL		    
+		);
+	`)
+
+	for _, err := range []error{err, err1, err2, err3} {
 		if err != nil {
 			return fmt.Errorf("error creating table: %v", err)
 		}
