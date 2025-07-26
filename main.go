@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -31,6 +32,42 @@ type ISPState struct {
 
 var ispPrimaryState bool = true
 var ispSecondaryState bool = true
+
+// ISP state cache for reducing database queries
+type ISPStateCache struct {
+	sync.RWMutex
+	primaryState   ISPState
+	secondaryState ISPState
+	lastUpdated    time.Time
+	initialized    bool
+}
+
+var ispStateCache = &ISPStateCache{}
+
+// Channel for notifying GPIO logic of ISP state changes
+var ispStateChangeNotifier = make(chan bool, 1)
+
+// Cache methods for ISP states
+func (cache *ISPStateCache) updateStates(primary, secondary ISPState) {
+	cache.Lock()
+	defer cache.Unlock()
+	cache.primaryState = primary
+	cache.secondaryState = secondary
+	cache.lastUpdated = time.Now()
+	cache.initialized = true
+}
+
+func (cache *ISPStateCache) getStates() (ISPState, ISPState, bool) {
+	cache.RLock()
+	defer cache.RUnlock()
+	return cache.primaryState, cache.secondaryState, cache.initialized
+}
+
+func (cache *ISPStateCache) isStale(maxAge time.Duration) bool {
+	cache.RLock()
+	defer cache.RUnlock()
+	return !cache.initialized || time.Since(cache.lastUpdated) > maxAge
+}
 
 var DOW = map[string]int{
 	"monday":    1,
@@ -80,6 +117,12 @@ func main() {
 	}
 	defer db.Close()
 
+	//configure database for concurrency
+	err = configureDatabase(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	//create tables if they dont exist
 	err = createTables(db)
 	if err != nil {
@@ -102,63 +145,209 @@ func main() {
 }
 
 func startGPIOlogic(db *sql.DB) {
-	// query the database for the ispstates table
-	// check the table for any amount of rows, if it has more than 0 rows, then retrieve the values
-	// if it has 0 rows, then insert the default values
-	var count int
-
-	primaryISPState := ISPState{}
-	secondaryISPState := ISPState{}
-
-	err := db.QueryRow("SELECT COUNT(*) FROM ispstates").Scan(&count)
+	// Initialize ISP states - check if table has data, if not create defaults
+	err := initializeISPStates(db)
 	if err != nil {
-		fmt.Println(err)
-		fmt.Println("Error counting rows in ispstates table:", err)
+		fmt.Println("Error initializing ISP states:", err)
+		log.Fatal(err)
+	}
+
+	// Load initial data into cache
+	err = refreshISPStateCache(db)
+	if err != nil {
+		fmt.Println("Error loading initial ISP states into cache:", err)
+		log.Fatal(err)
+	}
+
+	fmt.Println("GPIO logic started with cached ISP states")
+
+	// Cache refresh interval (every 60 seconds instead of 5)
+	cacheRefreshInterval := 60 * time.Second
+	
+	// Create ticker for periodic checks (as backup)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ispStateChangeNotifier:
+			// ISP state changed - process immediately
+			fmt.Println("ISP state change notification received")
+			err := refreshISPStateCache(db)
+			if err != nil {
+				fmt.Println("Error refreshing ISP state cache after notification:", err)
+			} else {
+				fmt.Println("ISP state cache refreshed from database after change notification")
+			}
+			processGPIOLogic()
+			
+		case <-ticker.C:
+			// Periodic check (backup mechanism)
+			if ispStateCache.isStale(cacheRefreshInterval) {
+				err := refreshISPStateCache(db)
+				if err != nil {
+					fmt.Println("Error refreshing ISP state cache:", err)
+				} else {
+					fmt.Println("ISP state cache refreshed from database (periodic)")
+				}
+			}
+			processGPIOLogic()
+		}
+	}
+}
+
+func processGPIOLogic() {
+	// Get current states from cache (no database query)
+	primary, secondary, initialized := ispStateCache.getStates()
+	if !initialized {
+		fmt.Println("ISP state cache not initialized, skipping GPIO processing")
 		return
 	}
 
-	if count == 0 {
-		//"Table is empty" - lets populate it with default values
-		for isp := range 2 {
-			fmt.Printf("Table is empty, inserting default values for isp %d\n", isp)
-			stmt, err := db.Prepare("INSERT INTO ispstates (ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec) VALUES (?, ?, ?, ?)")
-			if err != nil {
-				fmt.Println("Error preparing statement for isp", isp, ":", err)
-				log.Fatal(err)
-			}
-			defer stmt.Close()
+	fmt.Println("Primary ISP State (cached):", primary)
+	fmt.Println("Secondary ISP State (cached):", secondary)
+	
+	// TODO: Add actual GPIO logic here based on the states
+	// Example GPIO logic:
+	// - Check if primary.PowerState is false and if enough time has passed since off
+	// - Control GPIO pins based on power states
+	// - Handle restart timers and durations
+	
+	currentTime := time.Now().Unix()
+	
+	// Example: If ISP should be turned back on
+	if !primary.PowerState && primary.OffUntilUxtimesec > 0 && currentTime >= primary.OffUntilUxtimesec {
+		fmt.Printf("Primary ISP should be turned back on (off until %d, now %d)\n", primary.OffUntilUxtimesec, currentTime)
+		// TODO: Add GPIO pin control here
+	}
+	
+	if !secondary.PowerState && secondary.OffUntilUxtimesec > 0 && currentTime >= secondary.OffUntilUxtimesec {
+		fmt.Printf("Secondary ISP should be turned back on (off until %d, now %d)\n", secondary.OffUntilUxtimesec, currentTime)
+		// TODO: Add GPIO pin control here
+	}
+}
 
-			_, err = stmt.Exec(isp, 1, 0, 0) //isp 0 is primary, 1 is secondary, power state is always on by default- times are populated when restart button is pressed
-			if err != nil {
-				fmt.Println("Error inserting default values for isp", isp, ":", err)
-				log.Fatal(err)
+// Helper function to notify GPIO logic of state changes
+func notifyISPStateChange() {
+	select {
+	case ispStateChangeNotifier <- true:
+		// Notification sent
+	default:
+		// Channel is full, skip (prevents blocking)
+	}
+}
+
+// Database operation retry helper
+func retryDatabaseOperation(operation func() error, maxRetries int, retryDelay time.Duration) error {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			fmt.Printf("Retrying database operation (attempt %d/%d)\n", attempt, maxRetries)
+			time.Sleep(retryDelay)
+		}
+		
+		lastErr = operation()
+		if lastErr == nil {
+			return nil // Success
+		}
+		
+		// Check if this is a retryable error (busy/locked)
+		if strings.Contains(lastErr.Error(), "database is locked") || 
+		   strings.Contains(lastErr.Error(), "database is busy") {
+			if attempt < maxRetries {
+				fmt.Printf("Database busy/locked, retrying... (error: %v)\n", lastErr)
+				continue
 			}
+		} else {
+			// Non-retryable error, fail immediately
+			return lastErr
 		}
 	}
+	return fmt.Errorf("database operation failed after %d retries: %v", maxRetries, lastErr)
+}
 
-	for {
-		fmt.Println(count)
-		if count > 0 { //"Table is not empty" - lets retrieve the values
-			for isp := range 2 {
-				if isp == 0 {
-					var err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").Scan(&primaryISPState.ISPID, &primaryISPState.PowerState, &primaryISPState.UxtimeWhenOffRequested, &primaryISPState.OffUntilUxtimesec)
+// Transaction helper with retry logic
+func executeTransaction(db *sql.DB, operation func(*sql.Tx) error) error {
+	return retryDatabaseOperation(func() error {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %v", err)
+		}
+		defer tx.Rollback() // Rollback if not committed
+
+		err = operation(tx)
+		if err != nil {
+			return err
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("failed to commit transaction: %v", err)
+		}
+
+		return nil
+	}, 3, 100*time.Millisecond)
+}
+
+func initializeISPStates(db *sql.DB) error {
+	return retryDatabaseOperation(func() error {
+		var count int
+		err := db.QueryRow("SELECT COUNT(*) FROM ispstates").Scan(&count)
+		if err != nil {
+			return fmt.Errorf("error counting rows in ispstates table: %v", err)
+		}
+
+		if count == 0 {
+			// Use transaction for inserting default values
+			return executeTransaction(db, func(tx *sql.Tx) error {
+				for isp := range 2 {
+					fmt.Printf("Table is empty, inserting default values for isp %d\n", isp)
+					stmt, err := tx.Prepare("INSERT INTO ispstates (ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec) VALUES (?, ?, ?, ?)")
 					if err != nil {
-						fmt.Println("Error retrieving values for primary isp:", err)
-						log.Fatal(err)
+						return fmt.Errorf("error preparing statement for isp %d: %v", isp, err)
 					}
-				} else if isp == 1 {
-					var err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").Scan(&secondaryISPState.ISPID, &secondaryISPState.PowerState, &secondaryISPState.UxtimeWhenOffRequested, &secondaryISPState.OffUntilUxtimesec)
+					defer stmt.Close()
+
+					_, err = stmt.Exec(isp, 1, 0, 0) // isp 0 is primary, 1 is secondary, power state is always on by default
 					if err != nil {
-						fmt.Println("Error retrieving values for secondary isp:", err)
-						log.Fatal(err)
+						return fmt.Errorf("error inserting default values for isp %d: %v", isp, err)
 					}
 				}
-			}
+				fmt.Println("Initialized ISP states with default values")
+				return nil
+			})
 		}
-		time.Sleep(5 * time.Second) // sleep for 10 seconds before checking again
-		fmt.Println("Primary ISP State:", primaryISPState)
-		fmt.Println("Secondary ISP State:", secondaryISPState)
-	}
+		return nil
+	}, 3, 200*time.Millisecond) // 3 retries with 200ms delay for initialization
+}
+
+func refreshISPStateCache(db *sql.DB) error {
+	return retryDatabaseOperation(func() error {
+		primaryISPState := ISPState{}
+		secondaryISPState := ISPState{}
+
+		// Query primary ISP state
+		err := db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").
+			Scan(&primaryISPState.ISPID, &primaryISPState.PowerState, &primaryISPState.UxtimeWhenOffRequested, &primaryISPState.OffUntilUxtimesec)
+		if err != nil {
+			return fmt.Errorf("error retrieving primary ISP state: %v", err)
+		}
+
+		// Query secondary ISP state
+		err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 1").
+			Scan(&secondaryISPState.ISPID, &secondaryISPState.PowerState, &secondaryISPState.UxtimeWhenOffRequested, &secondaryISPState.OffUntilUxtimesec)
+		if err != nil {
+			return fmt.Errorf("error retrieving secondary ISP state: %v", err)
+		}
+
+		// Update cache with retrieved values
+		ispStateCache.updateStates(primaryISPState, secondaryISPState)
+		
+		// Notify GPIO logic of state change (non-blocking)
+		notifyISPStateChange()
+		
+		return nil
+	}, 3, 100*time.Millisecond) // 3 retries with 100ms delay
 }
 
 func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im not sure if this is a bad idea
@@ -356,6 +545,28 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 	}
 }
 
+func configureDatabase(db *sql.DB) error {
+	// Enable WAL mode for better concurrency (allows concurrent readers)
+	_, err := db.Exec("PRAGMA journal_mode=WAL")
+	if err != nil {
+		return fmt.Errorf("failed to enable WAL mode: %v", err)
+	}
+
+	// Set busy timeout to handle lock contention (5 seconds)
+	_, err = db.Exec("PRAGMA busy_timeout=5000")
+	if err != nil {
+		return fmt.Errorf("failed to set busy timeout: %v", err)
+	}
+
+	// Configure connection pooling for optimal concurrency
+	db.SetMaxOpenConns(10)  // Maximum number of open connections
+	db.SetMaxIdleConns(5)   // Maximum number of idle connections
+	db.SetConnMaxLifetime(time.Hour) // Connection max lifetime
+
+	fmt.Println("Database configured for concurrency with WAL mode and connection pooling")
+	return nil
+}
+
 func createTables(db *sql.DB) error {
 	_, err := db.Exec(`
         CREATE TABLE IF NOT EXISTS pings (
@@ -419,13 +630,19 @@ func PrintPingResults(db *sql.DB, pingResults chan map[string]int) {
 		googleMS := result["google"]
 		facebookMS := result["facebook"]
 		xMS := result["x"]
-		query := `
-			INSERT INTO pings (uxtimesec, cloudflare, google, facebook, x)
-			VALUES (?, ?, ?, ?, ?);
-		`
-		_, err := db.Exec(query, unixTimestamp, cloudflareMS, googleMS, facebookMS, xMS)
+		
+		// Use retry logic for ping data insertion
+		err := retryDatabaseOperation(func() error {
+			query := `
+				INSERT INTO pings (uxtimesec, cloudflare, google, facebook, x)
+				VALUES (?, ?, ?, ?, ?);
+			`
+			_, err := db.Exec(query, unixTimestamp, cloudflareMS, googleMS, facebookMS, xMS)
+			return err
+		}, 3, 50*time.Millisecond) // 3 retries with 50ms delay for ping data
+		
 		if err != nil {
-			log.Println("error inserting entry: %v", err)
+			log.Printf("error inserting ping entry after retries: %v", err)
 		}
 	}
 }
