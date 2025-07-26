@@ -161,34 +161,21 @@ func startGPIOlogic(db *sql.DB) {
 
 	fmt.Println("GPIO logic started with cached ISP states")
 
-	// Cache refresh interval (every 60 seconds instead of 5)
-	cacheRefreshInterval := 60 * time.Second
+	// Cache refresh interval (every 30 seconds for responsive updates)
+	cacheRefreshInterval := 30 * time.Second
 	
-	// Create ticker for periodic checks (as backup)
-	ticker := time.NewTicker(30 * time.Second)
+	// Create ticker for periodic checks
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	
 	for {
 		select {
-		case <-ispStateChangeNotifier:
-			// ISP state changed - process immediately
-			fmt.Println("ISP state change notification received")
-			err := refreshISPStateCache(db)
-			if err != nil {
-				fmt.Println("Error refreshing ISP state cache after notification:", err)
-			} else {
-				fmt.Println("ISP state cache refreshed from database after change notification")
-			}
-			processGPIOLogic()
-			
 		case <-ticker.C:
-			// Periodic check (backup mechanism)
+			// Periodic check and refresh if stale
 			if ispStateCache.isStale(cacheRefreshInterval) {
 				err := refreshISPStateCache(db)
 				if err != nil {
 					fmt.Println("Error refreshing ISP state cache:", err)
-				} else {
-					fmt.Println("ISP state cache refreshed from database (periodic)")
 				}
 			}
 			processGPIOLogic()
@@ -200,30 +187,29 @@ func processGPIOLogic() {
 	// Get current states from cache (no database query)
 	primary, secondary, initialized := ispStateCache.getStates()
 	if !initialized {
-		fmt.Println("ISP state cache not initialized, skipping GPIO processing")
 		return
 	}
 
-	fmt.Println("Primary ISP State (cached):", primary)
-	fmt.Println("Secondary ISP State (cached):", secondary)
-	
-	// TODO: Add actual GPIO logic here based on the states
-	// Example GPIO logic:
-	// - Check if primary.PowerState is false and if enough time has passed since off
-	// - Control GPIO pins based on power states
-	// - Handle restart timers and durations
-	
+	// Reduced logging - only log when there are actual actions to take
 	currentTime := time.Now().Unix()
 	
 	// Example: If ISP should be turned back on
 	if !primary.PowerState && primary.OffUntilUxtimesec > 0 && currentTime >= primary.OffUntilUxtimesec {
 		fmt.Printf("Primary ISP should be turned back on (off until %d, now %d)\n", primary.OffUntilUxtimesec, currentTime)
 		// TODO: Add GPIO pin control here
+		hasActions = true
 	}
 	
 	if !secondary.PowerState && secondary.OffUntilUxtimesec > 0 && currentTime >= secondary.OffUntilUxtimesec {
 		fmt.Printf("Secondary ISP should be turned back on (off until %d, now %d)\n", secondary.OffUntilUxtimesec, currentTime)
 		// TODO: Add GPIO pin control here
+		hasActions = true
+	}
+	
+	// Only log states when there are actions or during startup
+	if hasActions {
+		fmt.Println("Primary ISP State:", primary)
+		fmt.Println("Secondary ISP State:", secondary)
 	}
 }
 
@@ -255,7 +241,10 @@ func retryDatabaseOperation(operation func() error, maxRetries int, retryDelay t
 		if strings.Contains(lastErr.Error(), "database is locked") || 
 		   strings.Contains(lastErr.Error(), "database is busy") {
 			if attempt < maxRetries {
-				fmt.Printf("Database busy/locked, retrying... (error: %v)\n", lastErr)
+				// Reduced logging to prevent spam
+				if attempt == 1 {
+					fmt.Printf("Database busy/locked, retrying... (error: %v)\n", lastErr)
+				}
 				continue
 			}
 		} else {
@@ -342,9 +331,6 @@ func refreshISPStateCache(db *sql.DB) error {
 
 		// Update cache with retrieved values
 		ispStateCache.updateStates(primaryISPState, secondaryISPState)
-		
-		// Notify GPIO logic of state change (non-blocking)
-		notifyISPStateChange()
 		
 		return nil
 	}, 3, 100*time.Millisecond) // 3 retries with 100ms delay
@@ -552,18 +538,24 @@ func configureDatabase(db *sql.DB) error {
 		return fmt.Errorf("failed to enable WAL mode: %v", err)
 	}
 
-	// Set busy timeout to handle lock contention (5 seconds)
-	_, err = db.Exec("PRAGMA busy_timeout=5000")
+	// Set busy timeout to handle lock contention (reduced from 5s to 1s)
+	_, err = db.Exec("PRAGMA busy_timeout=1000")
 	if err != nil {
 		return fmt.Errorf("failed to set busy timeout: %v", err)
 	}
 
-	// Configure connection pooling for optimal concurrency
-	db.SetMaxOpenConns(10)  // Maximum number of open connections
-	db.SetMaxIdleConns(5)   // Maximum number of idle connections
-	db.SetConnMaxLifetime(time.Hour) // Connection max lifetime
+	// Optimize WAL mode settings
+	_, err = db.Exec("PRAGMA synchronous=NORMAL") // Faster writes
+	if err != nil {
+		return fmt.Errorf("failed to set synchronous mode: %v", err)
+	}
 
-	fmt.Println("Database configured for concurrency with WAL mode and connection pooling")
+	// Configure connection pooling for optimal concurrency (reduced for less overhead)
+	db.SetMaxOpenConns(5)   // Reduced from 10 to 5
+	db.SetMaxIdleConns(2)   // Reduced from 5 to 2
+	db.SetConnMaxLifetime(30 * time.Minute) // Reduced from 1 hour
+
+	fmt.Println("Database configured for concurrency with optimized WAL mode")
 	return nil
 }
 
@@ -631,18 +623,14 @@ func PrintPingResults(db *sql.DB, pingResults chan map[string]int) {
 		facebookMS := result["facebook"]
 		xMS := result["x"]
 		
-		// Use retry logic for ping data insertion
-		err := retryDatabaseOperation(func() error {
-			query := `
-				INSERT INTO pings (uxtimesec, cloudflare, google, facebook, x)
-				VALUES (?, ?, ?, ?, ?);
-			`
-			_, err := db.Exec(query, unixTimestamp, cloudflareMS, googleMS, facebookMS, xMS)
-			return err
-		}, 3, 50*time.Millisecond) // 3 retries with 50ms delay for ping data
-		
+		// Simple insert without retry for high-frequency ping data
+		query := `
+			INSERT INTO pings (uxtimesec, cloudflare, google, facebook, x)
+			VALUES (?, ?, ?, ?, ?);
+		`
+		_, err := db.Exec(query, unixTimestamp, cloudflareMS, googleMS, facebookMS, xMS)
 		if err != nil {
-			log.Printf("error inserting ping entry after retries: %v", err)
+			log.Printf("error inserting ping entry: %v", err)
 		}
 	}
 }
