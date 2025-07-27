@@ -178,12 +178,12 @@ func startGPIOlogic(db *sql.DB) {
 					fmt.Println("Error refreshing ISP state cache:", err)
 				}
 			}
-			processGPIOLogic()
+			processGPIOLogic(db)
 		}
 	}
 }
 
-func processGPIOLogic() {
+func processGPIOLogic(db *sql.DB) {
 	// Get current states from cache (no database query)
 	primary, secondary, initialized := ispStateCache.getStates()
 	if !initialized {
@@ -192,21 +192,118 @@ func processGPIOLogic() {
 
 	// Reduced logging - only log when there are actual actions to take
 	currentTime := time.Now().Unix()
+	hasActions := false
 	
-	// Example: If ISP should be turned back on
-	if !primary.PowerState && primary.OffUntilUxtimesec > 0 && currentTime >= primary.OffUntilUxtimesec {
-		fmt.Printf("Primary ISP should be turned back on (off until %d, now %d)\n", primary.OffUntilUxtimesec, currentTime)
-		// TODO: Add GPIO pin control here
+	// PRIMARY ISP LOGIC
+	if !primary.PowerState {  // Primary ISP is currently OFF
+		
+		if primary.OffUntilUxtimesec == 0 {
+			// IMMEDIATE RESTART CASE - Turn on immediately
+			fmt.Printf("Primary ISP immediate restart - turning ON\n")
+			
+			// GPIO: Turn primary ISP back ON (placeholder)
+			// TODO: Replace with actual GPIO library calls
+			// gpio.WritePin(18, gpio.High)  // Example GPIO pin 18
+			fmt.Printf("GPIO: Primary ISP pin set to HIGH (ON)\n")
+			
+			// Update database: ISP is back on, reset timers
+			err := updateISPPowerState(db, 0, true, 0, 0)
+			if err != nil {
+				fmt.Printf("Error updating primary ISP power state: %v\n", err)
+			} else {
+				fmt.Printf("Primary ISP state updated in database: ON\n")
+			}
+			hasActions = true
+			
+		} else if currentTime >= primary.OffUntilUxtimesec {
+			// TIMED RESTART CASE - Time has expired, turn back on
+			fmt.Printf("Primary ISP timed restart - turning ON (off until %d, now %d)\n", primary.OffUntilUxtimesec, currentTime)
+			
+			// GPIO: Turn primary ISP back ON (placeholder)
+			// TODO: Replace with actual GPIO library calls
+			// gpio.WritePin(18, gpio.High)  // Example GPIO pin 18
+			fmt.Printf("GPIO: Primary ISP pin set to HIGH (ON)\n")
+			
+			// Update database: ISP is back on, reset timers
+			err := updateISPPowerState(db, 0, true, 0, 0)
+			if err != nil {
+				fmt.Printf("Error updating primary ISP power state: %v\n", err)
+			} else {
+				fmt.Printf("Primary ISP state updated in database: ON\n")
+			}
+			hasActions = true
+			
+		} else {
+			// TIMED RESTART CASE - Still waiting, keep ISP off
+			// No action needed, just waiting for timer
+		}
+		
+	} else if primary.PowerState && primary.UxtimeWhenOffRequested > 0 {
+		// PRIMARY ISP WAS JUST REQUESTED TO BE TURNED OFF
+		fmt.Printf("Primary ISP restart requested - turning OFF\n")
+		
+		// GPIO: Turn primary ISP OFF (placeholder)
+		// TODO: Replace with actual GPIO library calls  
+		// gpio.WritePin(18, gpio.Low)  // Example GPIO pin 18
+		fmt.Printf("GPIO: Primary ISP pin set to LOW (OFF)\n")
+		
+		// Database update happens via cache refresh, no need to update here
 		hasActions = true
 	}
 	
-	if !secondary.PowerState && secondary.OffUntilUxtimesec > 0 && currentTime >= secondary.OffUntilUxtimesec {
-		fmt.Printf("Secondary ISP should be turned back on (off until %d, now %d)\n", secondary.OffUntilUxtimesec, currentTime)
-		// TODO: Add GPIO pin control here
+	// SECONDARY ISP LOGIC (same pattern as primary)
+	if !secondary.PowerState {  // Secondary ISP is currently OFF
+		
+		if secondary.OffUntilUxtimesec == 0 {
+			// IMMEDIATE RESTART CASE
+			fmt.Printf("Secondary ISP immediate restart - turning ON\n")
+			
+			// GPIO: Turn secondary ISP back ON (placeholder)
+			// TODO: Replace with actual GPIO library calls
+			// gpio.WritePin(19, gpio.High)  // Example GPIO pin 19
+			fmt.Printf("GPIO: Secondary ISP pin set to HIGH (ON)\n")
+			
+			// Update database: ISP is back on, reset timers
+			err := updateISPPowerState(db, 1, true, 0, 0)
+			if err != nil {
+				fmt.Printf("Error updating secondary ISP power state: %v\n", err)
+			} else {
+				fmt.Printf("Secondary ISP state updated in database: ON\n")
+			}
+			hasActions = true
+			
+		} else if currentTime >= secondary.OffUntilUxtimesec {
+			// TIMED RESTART CASE - Time has expired
+			fmt.Printf("Secondary ISP timed restart - turning ON (off until %d, now %d)\n", secondary.OffUntilUxtimesec, currentTime)
+			
+			// GPIO: Turn secondary ISP back ON (placeholder)
+			// TODO: Replace with actual GPIO library calls
+			// gpio.WritePin(19, gpio.High)  // Example GPIO pin 19  
+			fmt.Printf("GPIO: Secondary ISP pin set to HIGH (ON)\n")
+			
+			// Update database: ISP is back on, reset timers
+			err := updateISPPowerState(db, 1, true, 0, 0)
+			if err != nil {
+				fmt.Printf("Error updating secondary ISP power state: %v\n", err)
+			} else {
+				fmt.Printf("Secondary ISP state updated in database: ON\n")
+			}
+			hasActions = true
+		}
+		
+	} else if secondary.PowerState && secondary.UxtimeWhenOffRequested > 0 {
+		// SECONDARY ISP WAS JUST REQUESTED TO BE TURNED OFF
+		fmt.Printf("Secondary ISP restart requested - turning OFF\n")
+		
+		// GPIO: Turn secondary ISP OFF (placeholder)
+		// TODO: Replace with actual GPIO library calls
+		// gpio.WritePin(19, gpio.Low)  // Example GPIO pin 19
+		fmt.Printf("GPIO: Secondary ISP pin set to LOW (OFF)\n")
+		
 		hasActions = true
 	}
 	
-	// Only log states when there are actions or during startup
+	// Only log states when there are actions
 	if hasActions {
 		fmt.Println("Primary ISP State:", primary)
 		fmt.Println("Secondary ISP State:", secondary)
@@ -336,6 +433,25 @@ func refreshISPStateCache(db *sql.DB) error {
 	}, 3, 100*time.Millisecond) // 3 retries with 100ms delay
 }
 
+// Helper function to update ISP power state in database after GPIO actions
+func updateISPPowerState(db *sql.DB, ispID int, powerState bool, uxtimeWhenOffRequested int64, offUntilUxtimesec int64) error {
+	powerStateInt := 0
+	if powerState {
+		powerStateInt = 1
+	}
+	
+	return retryDatabaseOperation(func() error {
+		_, err := db.Exec(`
+			UPDATE ispstates 
+			SET powerstate = ?, 
+			    uxtimewhenoffrequested = ?, 
+			    offuntiluxtimesec = ? 
+			WHERE ispid = ?`,
+			powerStateInt, uxtimeWhenOffRequested, offUntilUxtimesec, ispID)
+		return err
+	}, 3, 100*time.Millisecond)
+}
+
 func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im not sure if this is a bad idea
 	return func(w http.ResponseWriter, r *http.Request) {
 		//fmt.Printf("Received %s request to %s\n", r.Method, r.URL.Path)
@@ -365,6 +481,8 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 			_, dailyRestart := payload["daily"]     // payload will be like {"hour": 0, "min": 0, "sec": 0 }
 			_, weeklyRestart := payload["weekly"]   // payload will be like {"dayinweek": 1, "hour": 0, "min": 0, "sec": 0 }
 			_, monthlyRestart := payload["monthly"] // payload will be like {"weekinmonth": 1, "dayinweek": 1, "hour": 0, "min": 0, "sec": 0 }
+			_, restartNowFound := payload["restartnow"]    // payload will be like {"restartnow": 1, "isp_id": 0}
+			_, restartForFound := payload["restartfor"]    // payload will be like {"restartfor": 150, "isp_id": 0}
 
 			if autorestartFound {
 				// handle autorestart request here where the toggle button is turned off
@@ -500,6 +618,86 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
 
 				json.NewEncoder(w).Encode(result)
+			} else if restartNowFound {
+				// Handle immediate ISP restart request
+				fmt.Println("Received restart now request with payload:", payload)
+				
+				// Extract ISP ID from payload
+				ispID, ok := payload["isp_id"].(float64)
+				if !ok {
+					http.Error(w, "Invalid isp_id format", http.StatusBadRequest)
+					return
+				}
+				
+				currentTime := time.Now().Unix()
+				
+				// Update database: set powerstate=0, uxtimewhenoffrequested=now, offuntiluxtimesec=0
+				err := retryDatabaseOperation(func() error {
+					_, err := db.Exec(`
+						UPDATE ispstates 
+						SET powerstate = 0, 
+						    uxtimewhenoffrequested = ?, 
+						    offuntiluxtimesec = 0 
+						WHERE ispid = ?`,
+						currentTime, int(ispID))
+					return err
+				}, 3, 100*time.Millisecond)
+				
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+					return
+				}
+				
+				fmt.Printf("ISP %d set for immediate restart\n", int(ispID))
+				
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "ISP restart now request processed successfully")
+				
+			} else if restartForFound {
+				// Handle timed ISP restart request
+				fmt.Println("Received restart for request with payload:", payload)
+				
+				// Extract ISP ID and duration from payload
+				ispID, ok := payload["isp_id"].(float64)
+				if !ok {
+					http.Error(w, "Invalid isp_id format", http.StatusBadRequest)
+					return
+				}
+				
+				durationMinutes, ok := payload["restartfor"].(float64)
+				if !ok {
+					http.Error(w, "Invalid restartfor format", http.StatusBadRequest)
+					return
+				}
+				
+				currentTime := time.Now().Unix()
+				offUntilTime := currentTime + (int64(durationMinutes) * 60) // Convert minutes to seconds
+				
+				// Update database: set powerstate=0, times accordingly
+				err := retryDatabaseOperation(func() error {
+					_, err := db.Exec(`
+						UPDATE ispstates 
+						SET powerstate = 0, 
+						    uxtimewhenoffrequested = ?, 
+						    offuntiluxtimesec = ? 
+						WHERE ispid = ?`,
+						currentTime, offUntilTime, int(ispID))
+					return err
+				}, 3, 100*time.Millisecond)
+				
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+					return
+				}
+				
+				fmt.Printf("ISP %d set for restart, off for %.0f minutes (until %d)\n", int(ispID), durationMinutes, offUntilTime)
+				
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "ISP restart for %.0f minutes request processed successfully", durationMinutes)
 			}
 		}
 
