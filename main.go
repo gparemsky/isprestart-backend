@@ -163,11 +163,11 @@ func startGPIOlogic(db *sql.DB) {
 
 	// Cache refresh interval (every 30 seconds for responsive updates)
 	cacheRefreshInterval := 30 * time.Second
-	
+
 	// Create ticker for periodic checks
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -193,19 +193,19 @@ func processGPIOLogic(db *sql.DB) {
 	// Reduced logging - only log when there are actual actions to take
 	currentTime := time.Now().Unix()
 	hasActions := false
-	
+
 	// PRIMARY ISP LOGIC
-	if !primary.PowerState {  // Primary ISP is currently OFF
-		
+	if !primary.PowerState { // Primary ISP is currently OFF
+
 		if primary.OffUntilUxtimesec == 0 {
 			// IMMEDIATE RESTART CASE - Turn on immediately
 			fmt.Printf("Primary ISP immediate restart - turning ON\n")
-			
+
 			// GPIO: Turn primary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
 			// gpio.WritePin(18, gpio.High)  // Example GPIO pin 18
 			fmt.Printf("GPIO: Primary ISP pin set to HIGH (ON)\n")
-			
+
 			// Update database: ISP is back on, reset timers
 			err := updateISPPowerState(db, 0, true, 0, 0)
 			if err != nil {
@@ -214,16 +214,16 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Primary ISP state updated in database: ON\n")
 			}
 			hasActions = true
-			
+
 		} else if currentTime >= primary.OffUntilUxtimesec {
 			// TIMED RESTART CASE - Time has expired, turn back on
 			fmt.Printf("Primary ISP timed restart - turning ON (off until %d, now %d)\n", primary.OffUntilUxtimesec, currentTime)
-			
+
 			// GPIO: Turn primary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
 			// gpio.WritePin(18, gpio.High)  // Example GPIO pin 18
 			fmt.Printf("GPIO: Primary ISP pin set to HIGH (ON)\n")
-			
+
 			// Update database: ISP is back on, reset timers
 			err := updateISPPowerState(db, 0, true, 0, 0)
 			if err != nil {
@@ -232,37 +232,37 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Primary ISP state updated in database: ON\n")
 			}
 			hasActions = true
-			
+
 		} else {
 			// TIMED RESTART CASE - Still waiting, keep ISP off
 			// No action needed, just waiting for timer
 		}
-		
+
 	} else if primary.PowerState && primary.UxtimeWhenOffRequested > 0 {
 		// PRIMARY ISP WAS JUST REQUESTED TO BE TURNED OFF
 		fmt.Printf("Primary ISP restart requested - turning OFF\n")
-		
+
 		// GPIO: Turn primary ISP OFF (placeholder)
-		// TODO: Replace with actual GPIO library calls  
+		// TODO: Replace with actual GPIO library calls
 		// gpio.WritePin(18, gpio.Low)  // Example GPIO pin 18
 		fmt.Printf("GPIO: Primary ISP pin set to LOW (OFF)\n")
-		
+
 		// Database update happens via cache refresh, no need to update here
 		hasActions = true
 	}
-	
+
 	// SECONDARY ISP LOGIC (same pattern as primary)
-	if !secondary.PowerState {  // Secondary ISP is currently OFF
-		
+	if !secondary.PowerState { // Secondary ISP is currently OFF
+
 		if secondary.OffUntilUxtimesec == 0 {
 			// IMMEDIATE RESTART CASE
 			fmt.Printf("Secondary ISP immediate restart - turning ON\n")
-			
+
 			// GPIO: Turn secondary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
 			// gpio.WritePin(19, gpio.High)  // Example GPIO pin 19
 			fmt.Printf("GPIO: Secondary ISP pin set to HIGH (ON)\n")
-			
+
 			// Update database: ISP is back on, reset timers
 			err := updateISPPowerState(db, 1, true, 0, 0)
 			if err != nil {
@@ -271,16 +271,16 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
 			}
 			hasActions = true
-			
+
 		} else if currentTime >= secondary.OffUntilUxtimesec {
 			// TIMED RESTART CASE - Time has expired
 			fmt.Printf("Secondary ISP timed restart - turning ON (off until %d, now %d)\n", secondary.OffUntilUxtimesec, currentTime)
-			
+
 			// GPIO: Turn secondary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
-			// gpio.WritePin(19, gpio.High)  // Example GPIO pin 19  
+			// gpio.WritePin(19, gpio.High)  // Example GPIO pin 19
 			fmt.Printf("GPIO: Secondary ISP pin set to HIGH (ON)\n")
-			
+
 			// Update database: ISP is back on, reset timers
 			err := updateISPPowerState(db, 1, true, 0, 0)
 			if err != nil {
@@ -290,19 +290,19 @@ func processGPIOLogic(db *sql.DB) {
 			}
 			hasActions = true
 		}
-		
+
 	} else if secondary.PowerState && secondary.UxtimeWhenOffRequested > 0 {
 		// SECONDARY ISP WAS JUST REQUESTED TO BE TURNED OFF
 		fmt.Printf("Secondary ISP restart requested - turning OFF\n")
-		
+
 		// GPIO: Turn secondary ISP OFF (placeholder)
 		// TODO: Replace with actual GPIO library calls
 		// gpio.WritePin(19, gpio.Low)  // Example GPIO pin 19
 		fmt.Printf("GPIO: Secondary ISP pin set to LOW (OFF)\n")
-		
+
 		hasActions = true
 	}
-	
+
 	// Only log states when there are actions
 	if hasActions {
 		fmt.Println("Primary ISP State:", primary)
@@ -328,15 +328,15 @@ func retryDatabaseOperation(operation func() error, maxRetries int, retryDelay t
 			fmt.Printf("Retrying database operation (attempt %d/%d)\n", attempt, maxRetries)
 			time.Sleep(retryDelay)
 		}
-		
+
 		lastErr = operation()
 		if lastErr == nil {
 			return nil // Success
 		}
-		
+
 		// Check if this is a retryable error (busy/locked)
-		if strings.Contains(lastErr.Error(), "database is locked") || 
-		   strings.Contains(lastErr.Error(), "database is busy") {
+		if strings.Contains(lastErr.Error(), "database is locked") ||
+			strings.Contains(lastErr.Error(), "database is busy") {
 			if attempt < maxRetries {
 				// Reduced logging to prevent spam
 				if attempt == 1 {
@@ -428,7 +428,7 @@ func refreshISPStateCache(db *sql.DB) error {
 
 		// Update cache with retrieved values
 		ispStateCache.updateStates(primaryISPState, secondaryISPState)
-		
+
 		return nil
 	}, 3, 100*time.Millisecond) // 3 retries with 100ms delay
 }
@@ -439,7 +439,7 @@ func updateISPPowerState(db *sql.DB, ispID int, powerState bool, uxtimeWhenOffRe
 	if powerState {
 		powerStateInt = 1
 	}
-	
+
 	return retryDatabaseOperation(func() error {
 		_, err := db.Exec(`
 			UPDATE ispstates 
@@ -474,15 +474,15 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				return
 			}
 
-			fmt.Println("Received POST request with payload:", payload)
+			//fmt.Println("Received POST request with payload:", payload)
 
 			_, autorestartFound := payload["autorestart"]
 			_, rowsRequested := payload["Rows"]
-			_, dailyRestart := payload["daily"]     // payload will be like {"hour": 0, "min": 0, "sec": 0 }
-			_, weeklyRestart := payload["weekly"]   // payload will be like {"dayinweek": 1, "hour": 0, "min": 0, "sec": 0 }
-			_, monthlyRestart := payload["monthly"] // payload will be like {"weekinmonth": 1, "dayinweek": 1, "hour": 0, "min": 0, "sec": 0 }
-			_, restartNowFound := payload["restartnow"]    // payload will be like {"restartnow": 1, "isp_id": 0}
-			_, restartForFound := payload["restartfor"]    // payload will be like {"restartfor": 150, "isp_id": 0}
+			_, dailyRestart := payload["daily"]         // payload will be like {"hour": 0, "min": 0, "sec": 0 }
+			_, weeklyRestart := payload["weekly"]       // payload will be like {"dayinweek": 1, "hour": 0, "min": 0, "sec": 0 }
+			_, monthlyRestart := payload["monthly"]     // payload will be like {"weekinmonth": 1, "dayinweek": 1, "hour": 0, "min": 0, "sec": 0 }
+			_, restartNowFound := payload["restartnow"] // payload will be like {"restartnow": 1, "isp_id": 0}
+			_, restartForFound := payload["restartfor"] // payload will be like {"restartfor": 150, "isp_id": 0}
 
 			if autorestartFound {
 				// handle autorestart request here where the toggle button is turned off
@@ -621,16 +621,16 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 			} else if restartNowFound {
 				// Handle immediate ISP restart request
 				fmt.Println("Received restart now request with payload:", payload)
-				
+
 				// Extract ISP ID from payload
 				ispID, ok := payload["isp_id"].(float64)
 				if !ok {
 					http.Error(w, "Invalid isp_id format", http.StatusBadRequest)
 					return
 				}
-				
+
 				currentTime := time.Now().Unix()
-				
+
 				// Update database: set powerstate=0, uxtimewhenoffrequested=now, offuntiluxtimesec=0
 				err := retryDatabaseOperation(func() error {
 					_, err := db.Exec(`
@@ -642,39 +642,39 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 						currentTime, int(ispID))
 					return err
 				}, 3, 100*time.Millisecond)
-				
+
 				if err != nil {
 					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
 					return
 				}
-				
+
 				fmt.Printf("ISP %d set for immediate restart\n", int(ispID))
-				
+
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprint(w, "ISP restart now request processed successfully")
-				
+
 			} else if restartForFound {
 				// Handle timed ISP restart request
 				fmt.Println("Received restart for request with payload:", payload)
-				
+
 				// Extract ISP ID and duration from payload
 				ispID, ok := payload["isp_id"].(float64)
 				if !ok {
 					http.Error(w, "Invalid isp_id format", http.StatusBadRequest)
 					return
 				}
-				
+
 				durationMinutes, ok := payload["restartfor"].(float64)
 				if !ok {
 					http.Error(w, "Invalid restartfor format", http.StatusBadRequest)
 					return
 				}
-				
+
 				currentTime := time.Now().Unix()
 				offUntilTime := currentTime + (int64(durationMinutes) * 60) // Convert minutes to seconds
-				
+
 				// Update database: set powerstate=0, times accordingly
 				err := retryDatabaseOperation(func() error {
 					_, err := db.Exec(`
@@ -686,14 +686,14 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 						currentTime, offUntilTime, int(ispID))
 					return err
 				}, 3, 100*time.Millisecond)
-				
+
 				if err != nil {
 					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
 					return
 				}
-				
+
 				fmt.Printf("ISP %d set for restart, off for %.0f minutes (until %d)\n", int(ispID), durationMinutes, offUntilTime)
-				
+
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(http.StatusOK)
@@ -703,10 +703,10 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 
 		if r.Method == "GET" {
 
-			fmt.Println("Received GET request with payload:", payload)
+			//fmt.Println("Received GET request with payload:", payload)
 
 			params := r.URL.Query()
-			fmt.Println("Received autorestart query:", params)
+			//fmt.Println("Received autorestart query:", params)
 
 			autorestartQuery := params.Get("pagestate")
 
@@ -721,7 +721,7 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				}
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
-				fmt.Println("Sending autorestart data:", autorestart)
+				//fmt.Println("Sending autorestart data:", autorestart)
 				json.NewEncoder(w).Encode(autorestart)
 			}
 
@@ -749,8 +749,8 @@ func configureDatabase(db *sql.DB) error {
 	}
 
 	// Configure connection pooling for optimal concurrency (reduced for less overhead)
-	db.SetMaxOpenConns(5)   // Reduced from 10 to 5
-	db.SetMaxIdleConns(2)   // Reduced from 5 to 2
+	db.SetMaxOpenConns(5)                   // Reduced from 10 to 5
+	db.SetMaxIdleConns(2)                   // Reduced from 5 to 2
 	db.SetConnMaxLifetime(30 * time.Minute) // Reduced from 1 hour
 
 	fmt.Println("Database configured for concurrency with optimized WAL mode")
@@ -812,15 +812,15 @@ func createTables(db *sql.DB) error {
 func PrintPingResults(db *sql.DB, pingResults chan map[string]int) {
 
 	for result := range pingResults {
-		log.Println(result)
+		//log.Println(result)
 		now := time.Now()
 		unixTimestamp := now.Unix()
-		log.Println(unixTimestamp)
+		//log.Println(unixTimestamp)
 		cloudflareMS := result["cloudflare"]
 		googleMS := result["google"]
 		facebookMS := result["facebook"]
 		xMS := result["x"]
-		
+
 		// Simple insert without retry for high-frequency ping data
 		query := `
 			INSERT INTO pings (uxtimesec, cloudflare, google, facebook, x)
