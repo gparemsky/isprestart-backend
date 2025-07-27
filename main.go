@@ -1616,14 +1616,26 @@ func startCommandInterface(db *sql.DB) {
 
 func startSimpleInput(db *sql.DB) {
 	reader := bufio.NewReader(os.Stdin)
+	eofCount := 0
 	
 	for {
 		fmt.Print("\n[CMD] Enter command (help for list): ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
+			eofCount++
 			fmt.Printf("[CMD ERROR] Error reading input: %v\n", err)
+			
+			// If we get multiple EOF errors in a row, stdin is not available
+			// This happens when running as a service or without a terminal
+			if eofCount >= 3 {
+				fmt.Println("[CMD] No interactive terminal detected, disabling command input")
+				return
+			}
 			continue
 		}
+		
+		// Reset EOF count on successful read
+		eofCount = 0
 		
 		command := strings.TrimSpace(input)
 		if command != "" {
