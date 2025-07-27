@@ -212,6 +212,7 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating primary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Primary ISP state updated in database: ON\n")
+				logEvent(db, "Primary ISP restarted - immediate restart completed")
 			}
 			hasActions = true
 
@@ -230,6 +231,7 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating primary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Primary ISP state updated in database: ON\n")
+				logEvent(db, "Primary ISP powered on - scheduled restart completed")
 			}
 			hasActions = true
 
@@ -249,6 +251,7 @@ func processGPIOLogic(db *sql.DB) {
 
 		// Database update happens via cache refresh, no need to update here
 		hasActions = true
+		logEvent(db, "Primary ISP restart requested - turning off")
 	}
 
 	// SECONDARY ISP LOGIC (same pattern as primary)
@@ -269,6 +272,7 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating secondary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
+				logEvent(db, "Secondary ISP restarted - immediate restart completed")
 			}
 			hasActions = true
 
@@ -287,6 +291,7 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating secondary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
+				logEvent(db, "Secondary ISP powered on - scheduled restart completed")
 			}
 			hasActions = true
 		}
@@ -301,6 +306,7 @@ func processGPIOLogic(db *sql.DB) {
 		fmt.Printf("GPIO: Secondary ISP pin set to LOW (OFF)\n")
 
 		hasActions = true
+		logEvent(db, "Secondary ISP restart requested - turning off")
 	}
 
 	// Only log states when there are actions
@@ -709,6 +715,9 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 			//fmt.Println("Received autorestart query:", params)
 
 			autorestartQuery := params.Get("pagestate")
+			ispStatesQuery := params.Get("ispstates")
+			networkStatusQuery := params.Get("networkstatus")
+			logsQuery := params.Get("logs")
 
 			if autorestartQuery != "" {
 				// Handle get request for button state request data
@@ -723,6 +732,83 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
 				//fmt.Println("Sending autorestart data:", autorestart)
 				json.NewEncoder(w).Encode(autorestart)
+			} else if ispStatesQuery != "" {
+				// Handle ISP states request
+				var primaryState, secondaryState ISPState
+				
+				err := db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").
+					Scan(&primaryState.ISPID, &primaryState.PowerState, &primaryState.UxtimeWhenOffRequested, &primaryState.OffUntilUxtimesec)
+				if err != nil && err != sql.ErrNoRows {
+					http.Error(w, fmt.Sprintf("Error fetching primary ISP state: %v", err), http.StatusInternalServerError)
+					return
+				}
+				
+				err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 1").
+					Scan(&secondaryState.ISPID, &secondaryState.PowerState, &secondaryState.UxtimeWhenOffRequested, &secondaryState.OffUntilUxtimesec)
+				if err != nil && err != sql.ErrNoRows {
+					http.Error(w, fmt.Sprintf("Error fetching secondary ISP state: %v", err), http.StatusInternalServerError)
+					return
+				}
+				
+				response := map[string]interface{}{
+					"primary": primaryState,
+					"secondary": secondaryState,
+				}
+				
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(response)
+			} else if networkStatusQuery != "" {
+				// Handle network status request
+				var status NetworkStatus
+				
+				err := db.QueryRow("SELECT active_connection, public_ip, location, last_updated FROM network_status ORDER BY id DESC LIMIT 1").
+					Scan(&status.ActiveConnection, &status.PublicIP, &status.Location, &status.LastUpdated)
+				if err != nil {
+					if err == sql.ErrNoRows {
+						// Return default values if no data
+						status = NetworkStatus{
+							ActiveConnection: "Unknown",
+							PublicIP:         "Unknown",
+							Location:         "Unknown",
+							LastUpdated:      time.Now().Unix(),
+						}
+					} else {
+						http.Error(w, fmt.Sprintf("Error fetching network status: %v", err), http.StatusInternalServerError)
+						return
+					}
+				}
+				
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(status)
+			} else if logsQuery != "" {
+				// Handle logs request
+				limit, err := strconv.Atoi(logsQuery)
+				if err != nil || limit <= 0 {
+					limit = 10 // Default to 10 logs
+				}
+				
+				rows, err := db.Query("SELECT uxtimesec, reason FROM logs ORDER BY uxtimesec DESC LIMIT ?", limit)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Error fetching logs: %v", err), http.StatusInternalServerError)
+					return
+				}
+				defer rows.Close()
+				
+				logs := make([]Log, 0)
+				for rows.Next() {
+					var log Log
+					err = rows.Scan(&log.Uxtimesec, &log.Reason)
+					if err != nil {
+						continue
+					}
+					logs = append(logs, log)
+				}
+				
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(logs)
 			}
 
 		}
@@ -932,4 +1018,130 @@ func retriveSettings(db *sql.DB) {
 		}
 	}
 
+}
+
+// Monitor network status and update database
+func monitorNetworkStatus(db *sql.DB) {
+	// Initial update
+	updateNetworkStatus(db)
+	
+	// Update every minute
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		updateNetworkStatus(db)
+	}
+}
+
+func updateNetworkStatus(db *sql.DB) {
+	// Get public IP and location
+	ipInfo, err := getIPInfo()
+	if err != nil {
+		fmt.Printf("Error getting IP info: %v\n", err)
+		ipInfo = map[string]string{
+			"ip": "Unknown",
+			"city": "Unknown",
+			"region": "Unknown",
+			"country": "Unknown",
+		}
+	}
+	
+	// Determine active connection (simplified - you may want to enhance this)
+	var activeConnection string
+	if ispStateCache.primaryState.PowerState {
+		activeConnection = "Primary ISP"
+	} else if ispStateCache.secondaryState.PowerState {
+		activeConnection = "Secondary ISP"
+	} else {
+		activeConnection = "No Active Connection"
+	}
+	
+	location := fmt.Sprintf("%s, %s, %s", ipInfo["city"], ipInfo["region"], ipInfo["country"])
+	currentTime := time.Now().Unix()
+	
+	// Insert or update network status
+	err = retryDatabaseOperation(func() error {
+		// First, try to update existing record
+		result, err := db.Exec(`
+			UPDATE network_status 
+			SET active_connection = ?, public_ip = ?, location = ?, last_updated = ?
+			WHERE id = 1`,
+			activeConnection, ipInfo["ip"], location, currentTime)
+		if err != nil {
+			return err
+		}
+		
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		
+		// If no rows were updated, insert a new record
+		if rowsAffected == 0 {
+			_, err = db.Exec(`
+				INSERT INTO network_status (id, active_connection, public_ip, location, last_updated)
+				VALUES (1, ?, ?, ?, ?)`,
+				activeConnection, ipInfo["ip"], location, currentTime)
+			return err
+		}
+		
+		return nil
+	}, 3, 100*time.Millisecond)
+	
+	if err != nil {
+		fmt.Printf("Error updating network status: %v\n", err)
+	}
+}
+
+// Get public IP info using a free IP geolocation service
+func getIPInfo() (map[string]string, error) {
+	resp, err := http.Get("http://ip-api.com/json/")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	// Extract relevant fields
+	ipInfo := make(map[string]string)
+	if ip, ok := result["query"].(string); ok {
+		ipInfo["ip"] = ip
+	} else {
+		ipInfo["ip"] = "Unknown"
+	}
+	
+	if city, ok := result["city"].(string); ok {
+		ipInfo["city"] = city
+	} else {
+		ipInfo["city"] = "Unknown"
+	}
+	
+	if region, ok := result["regionName"].(string); ok {
+		ipInfo["region"] = region
+	} else {
+		ipInfo["region"] = "Unknown"
+	}
+	
+	if country, ok := result["country"].(string); ok {
+		ipInfo["country"] = country
+	} else {
+		ipInfo["country"] = "Unknown"
+	}
+	
+	return ipInfo, nil
+}
+
+// Log an event to the logs table
+func logEvent(db *sql.DB, reason string) error {
+	currentTime := time.Now().Unix()
+	
+	return retryDatabaseOperation(func() error {
+		_, err := db.Exec("INSERT INTO logs (uxtimesec, reason) VALUES (?, ?)", currentTime, reason)
+		return err
+	}, 3, 100*time.Millisecond)
 }
