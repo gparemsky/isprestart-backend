@@ -105,6 +105,18 @@ type PingRequest struct {
 	Rows int `json:"rows"`
 }
 
+type NetworkStatus struct {
+	ActiveConnection string `json:"active_connection"`
+	PublicIP         string `json:"public_ip"`
+	Location         string `json:"location"`
+	LastUpdated      int64  `json:"last_updated"`
+}
+
+type Log struct {
+	Uxtimesec int64  `json:"uxtimesec"`
+	Reason    string `json:"reason"`
+}
+
 type ServerResponse struct {
 	Message string `json:"message"`
 }
