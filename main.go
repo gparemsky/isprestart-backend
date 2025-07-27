@@ -7,14 +7,19 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"os/exec"
+	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -23,11 +28,56 @@ import (
 	"net/http"
 )
 
+// Log levels for filtering console output
+type LogLevel int
+
+const (
+	LOG_SILENT LogLevel = 0 // No output
+	LOG_ERROR  LogLevel = 1 // Only errors and critical events
+	LOG_WARN   LogLevel = 2 // Warnings and above
+	LOG_INFO   LogLevel = 3 // Important events (user actions, restarts)
+	LOG_DEBUG  LogLevel = 4 // Detailed info (some API calls)
+	LOG_TRACE  LogLevel = 5 // All output (everything)
+)
+
+var logLevelNames = map[LogLevel]string{
+	LOG_SILENT: "SILENT",
+	LOG_ERROR:  "ERROR",
+	LOG_WARN:   "WARN",
+	LOG_INFO:   "INFO",
+	LOG_DEBUG:  "DEBUG",
+	LOG_TRACE:  "TRACE",
+}
+
+// Terminal UI state
+type TerminalUI struct {
+	sync.RWMutex
+	logLevel       LogLevel
+	outputBuffer   []string
+	maxLines       int
+	currentInput   string
+	cursorPos      int
+	enabled        bool
+	terminalMode   bool // Whether we're using the split terminal UI
+	termHeight     int
+	termWidth      int
+	outputLines    int  // Number of lines for output area
+	inputStartRow  int  // Row where input area starts
+	needsRedraw    bool
+}
+
+var console = &TerminalUI{
+	logLevel:     LOG_INFO, // Default to INFO level
+	maxLines:     1000,     // Keep last 1000 lines
+	enabled:      true,
+	terminalMode: false, // Start in simple mode
+}
+
 type ISPState struct {
-	ISPID                  int
-	PowerState             bool
-	UxtimeWhenOffRequested int64
-	OffUntilUxtimesec      int64
+	ISPID                  int   `json:"ispid"`
+	PowerState             bool  `json:"powerstate"`
+	UxtimeWhenOffRequested int64 `json:"uxtimewhenoffrequested"`
+	OffUntilUxtimesec      int64 `json:"offuntiluxtimesec"`
 }
 
 var ispPrimaryState bool = true
@@ -43,6 +93,215 @@ type ISPStateCache struct {
 }
 
 var ispStateCache = &ISPStateCache{}
+
+// Terminal control functions
+func initTerminal() {
+	if runtime.GOOS == "windows" {
+		// On Windows, try to enable ANSI escape sequences
+		// This may not work on older Windows versions
+		console.terminalMode = false
+		return
+	}
+	
+	console.Lock()
+	defer console.Unlock()
+	
+	// Get terminal size
+	console.termHeight, console.termWidth = getTerminalSize()
+	if console.termHeight < 10 {
+		console.terminalMode = false
+		return
+	}
+	
+	// Reserve bottom 3 lines for input area
+	console.outputLines = console.termHeight - 3
+	console.inputStartRow = console.termHeight - 2
+	console.terminalMode = true
+	console.needsRedraw = true
+	
+	// Enable alternative screen buffer and hide cursor
+	fmt.Print("\033[?1049h\033[?25l")
+	
+	// Set up signal handler for cleanup
+	setupSignalHandler()
+	
+	redrawTerminal()
+}
+
+func getTerminalSize() (height, width int) {
+	// Try to get terminal size using stty (Unix/Linux/Mac)
+	if runtime.GOOS != "windows" {
+		cmd := exec.Command("stty", "size")
+		cmd.Stdin = os.Stdin
+		output, err := cmd.Output()
+		if err == nil {
+			fmt.Sscanf(string(output), "%d %d", &height, &width)
+			if height > 0 && width > 0 {
+				return height, width
+			}
+		}
+	}
+	
+	// Default fallback
+	return 24, 80
+}
+
+func setupSignalHandler() {
+	c := make(chan os.Signal, 1)
+	if runtime.GOOS != "windows" {
+		// SIGWINCH is not available on Windows
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.Signal(28)) // SIGWINCH = 28 on Unix
+	} else {
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	}
+	
+	go func() {
+		for sig := range c {
+			switch sig {
+			case syscall.Signal(28): // SIGWINCH on Unix
+				// Terminal resized
+				if console.terminalMode && runtime.GOOS != "windows" {
+					console.Lock()
+					console.termHeight, console.termWidth = getTerminalSize()
+					if console.termHeight >= 10 {
+						console.outputLines = console.termHeight - 3
+						console.inputStartRow = console.termHeight - 2
+						console.needsRedraw = true
+					}
+					console.Unlock()
+					redrawTerminal()
+				}
+			case os.Interrupt, syscall.SIGTERM:
+				cleanupTerminal()
+				os.Exit(0)
+			}
+		}
+	}()
+}
+
+func cleanupTerminal() {
+	if console.terminalMode {
+		// Show cursor and restore normal screen buffer
+		fmt.Print("\033[?25h\033[?1049l")
+	}
+}
+
+func redrawTerminal() {
+	if !console.terminalMode {
+		return
+	}
+	
+	// Clear screen
+	fmt.Print("\033[2J\033[H")
+	
+	// Draw output area
+	drawOutputArea()
+	
+	// Draw separator line
+	drawSeparator()
+	
+	// Draw input area
+	drawInputArea()
+	
+	console.needsRedraw = false
+}
+
+func drawOutputArea() {
+	console.RLock()
+	buffer := console.outputBuffer
+	console.RUnlock()
+	
+	// Calculate which lines to show
+	start := 0
+	if len(buffer) > console.outputLines {
+		start = len(buffer) - console.outputLines
+	}
+	
+	// Position cursor at top and draw output lines
+	fmt.Print("\033[H")
+	for i := 0; i < console.outputLines; i++ {
+		if start+i < len(buffer) {
+			line := buffer[start+i]
+			if len(line) > console.termWidth {
+				line = line[:console.termWidth-3] + "..."
+			}
+			fmt.Printf("%-*s\n", console.termWidth, line)
+		} else {
+			fmt.Printf("%-*s\n", console.termWidth, "")
+		}
+	}
+}
+
+func drawSeparator() {
+	// Move to separator line and draw it
+	fmt.Printf("\033[%d;1H", console.inputStartRow-1)
+	for i := 0; i < console.termWidth; i++ {
+		fmt.Print("─")
+	}
+}
+
+func drawInputArea() {
+	// Move to input line
+	fmt.Printf("\033[%d;1H", console.inputStartRow)
+	prompt := "[CMD] > "
+	fmt.Printf("%-*s", console.termWidth, prompt+console.currentInput)
+	
+	// Position cursor correctly
+	cursorCol := len(prompt) + console.cursorPos + 1
+	fmt.Printf("\033[%d;%dH", console.inputStartRow, cursorCol)
+}
+
+// Logging functions with levels
+func logAtLevel(level LogLevel, format string, args ...interface{}) {
+	if !console.enabled || level > console.logLevel {
+		return
+	}
+	
+	message := fmt.Sprintf(format, args...)
+	timestamp := time.Now().Format("15:04:05")
+	logLine := fmt.Sprintf("[%s] %s", timestamp, message)
+	
+	console.Lock()
+	console.outputBuffer = append(console.outputBuffer, logLine)
+	if len(console.outputBuffer) > console.maxLines {
+		console.outputBuffer = console.outputBuffer[1:]
+	}
+	console.Unlock()
+	
+	if console.terminalMode {
+		// In terminal mode, redraw only the output area
+		drawOutputArea()
+		drawInputArea() // Restore input area
+	} else {
+		// In simple mode, buffer output and only print periodically to reduce interruption
+		// This helps on Windows where we can't use the terminal UI
+		if level <= LOG_INFO || len(console.outputBuffer) % 10 == 0 {
+			// Print immediately for important messages or every 10th message
+			fmt.Println(logLine)
+		}
+		// Less important messages (DEBUG/TRACE) are still stored in buffer but not printed immediately
+	}
+}
+
+func logError(format string, args ...interface{}) {
+	logAtLevel(LOG_ERROR, "[ERROR] "+format, args...)
+}
+
+func logWarn(format string, args ...interface{}) {
+	logAtLevel(LOG_WARN, "[WARN] "+format, args...)
+}
+
+func logInfo(format string, args ...interface{}) {
+	logAtLevel(LOG_INFO, "[INFO] "+format, args...)
+}
+
+func logDebug(format string, args ...interface{}) {
+	logAtLevel(LOG_DEBUG, "[DEBUG] "+format, args...)
+}
+
+func logTrace(format string, args ...interface{}) {
+	logAtLevel(LOG_TRACE, "[TRACE] "+format, args...)
+}
 
 // Channel for notifying GPIO logic of ISP state changes
 var ispStateChangeNotifier = make(chan bool, 1)
@@ -122,9 +381,13 @@ type ServerResponse struct {
 }
 
 func main() {
+	// Initialize console with startup info
+	logInfo("ISP Monitor starting on %s/%s", runtime.GOOS, runtime.GOARCH)
+	
 	//connect to the sqlite db
 	db, err := sql.Open("sqlite", "./isprestart.db")
 	if err != nil {
+		logError("Failed to open database: %v", err)
 		log.Fatal(err)
 	}
 	defer db.Close()
@@ -132,16 +395,25 @@ func main() {
 	//configure database for concurrency
 	err = configureDatabase(db)
 	if err != nil {
+		logError("Failed to configure database: %v", err)
 		log.Fatal(err)
 	}
 
 	//create tables if they dont exist
 	err = createTables(db)
 	if err != nil {
+		logError("Failed to create tables: %v", err)
 		log.Fatal(err)
 	}
 
+	logInfo("Database initialized successfully")
+
 	go startGPIOlogic(db)
+	
+	// Initialize terminal UI
+	initTerminal()
+	
+	go startCommandInterface(db) // start command-line interface for testing
 
 	pingChannel := make(chan map[string]int)
 	go pingTest(pingChannel)             // start pinging
@@ -150,7 +422,9 @@ func main() {
 
 	http.HandleFunc("/api/ping-data", pingDataHandler(db))
 
-	fmt.Println("Server listening on port 8081")
+	logInfo("Server listening on port 8081")
+	logInfo("Command interface available - type 'help' for commands")
+	logInfo("Default log level: %s (use 'loglevel <level>' to change)", logLevelNames[console.logLevel])
 	http.ListenAndServe(":8081", nil)
 
 	select {} // keep the program running
@@ -160,18 +434,18 @@ func startGPIOlogic(db *sql.DB) {
 	// Initialize ISP states - check if table has data, if not create defaults
 	err := initializeISPStates(db)
 	if err != nil {
-		fmt.Println("Error initializing ISP states:", err)
+		logError("Error initializing ISP states: %v", err)
 		log.Fatal(err)
 	}
 
 	// Load initial data into cache
 	err = refreshISPStateCache(db)
 	if err != nil {
-		fmt.Println("Error loading initial ISP states into cache:", err)
+		logError("Error loading initial ISP states into cache: %v", err)
 		log.Fatal(err)
 	}
 
-	fmt.Println("GPIO logic started with cached ISP states")
+	logInfo("GPIO logic started with cached ISP states")
 
 	// Cache refresh interval (every 30 seconds for responsive updates)
 	cacheRefreshInterval := 30 * time.Second
@@ -211,31 +485,33 @@ func processGPIOLogic(db *sql.DB) {
 
 		if primary.OffUntilUxtimesec == 0 {
 			// IMMEDIATE RESTART CASE - Turn on immediately
-			fmt.Printf("Primary ISP immediate restart - turning ON\n")
+			logInfo("PRIMARY ISP: Immediate restart - turning ON")
 
 			// GPIO: Turn primary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
 			// gpio.WritePin(18, gpio.High)  // Example GPIO pin 18
-			fmt.Printf("GPIO: Primary ISP pin set to HIGH (ON)\n")
+			logInfo("GPIO: Primary ISP pin set to HIGH (ON)")
 
 			// Update database: ISP is back on, reset timers
 			err := updateISPPowerState(db, 0, true, 0, 0)
 			if err != nil {
-				fmt.Printf("Error updating primary ISP power state: %v\n", err)
+				logError("Error updating primary ISP power state: %v", err)
 			} else {
-				fmt.Printf("Primary ISP state updated in database: ON\n")
+				logInfo("Primary ISP state updated in database: ON")
 				logEvent(db, "Primary ISP restarted - immediate restart completed")
+				// Update autorestart table with restart timestamp
+				updateLastRestartTime(db, 0, time.Now().Unix())
 			}
 			hasActions = true
 
 		} else if currentTime >= primary.OffUntilUxtimesec {
 			// TIMED RESTART CASE - Time has expired, turn back on
-			fmt.Printf("Primary ISP timed restart - turning ON (off until %d, now %d)\n", primary.OffUntilUxtimesec, currentTime)
+			logInfo("PRIMARY ISP: Timed restart complete - turning ON (was off until %d, now %d)", primary.OffUntilUxtimesec, currentTime)
 
 			// GPIO: Turn primary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
 			// gpio.WritePin(18, gpio.High)  // Example GPIO pin 18
-			fmt.Printf("GPIO: Primary ISP pin set to HIGH (ON)\n")
+			logInfo("GPIO: Primary ISP pin set to HIGH (ON)")
 
 			// Update database: ISP is back on, reset timers
 			err := updateISPPowerState(db, 0, true, 0, 0)
@@ -244,6 +520,8 @@ func processGPIOLogic(db *sql.DB) {
 			} else {
 				fmt.Printf("Primary ISP state updated in database: ON\n")
 				logEvent(db, "Primary ISP powered on - scheduled restart completed")
+				// Update autorestart table with restart timestamp
+				updateLastRestartTime(db, 0, time.Now().Unix())
 			}
 			hasActions = true
 
@@ -254,12 +532,12 @@ func processGPIOLogic(db *sql.DB) {
 
 	} else if primary.PowerState && primary.UxtimeWhenOffRequested > 0 {
 		// PRIMARY ISP WAS JUST REQUESTED TO BE TURNED OFF
-		fmt.Printf("Primary ISP restart requested - turning OFF\n")
+		logInfo("PRIMARY ISP: Restart requested - turning OFF")
 
 		// GPIO: Turn primary ISP OFF (placeholder)
 		// TODO: Replace with actual GPIO library calls
 		// gpio.WritePin(18, gpio.Low)  // Example GPIO pin 18
-		fmt.Printf("GPIO: Primary ISP pin set to LOW (OFF)\n")
+		logInfo("GPIO: Primary ISP pin set to LOW (OFF)")
 
 		// Database update happens via cache refresh, no need to update here
 		hasActions = true
@@ -285,6 +563,8 @@ func processGPIOLogic(db *sql.DB) {
 			} else {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
 				logEvent(db, "Secondary ISP restarted - immediate restart completed")
+				// Update autorestart table with restart timestamp
+				updateLastRestartTime(db, 1, time.Now().Unix())
 			}
 			hasActions = true
 
@@ -304,6 +584,8 @@ func processGPIOLogic(db *sql.DB) {
 			} else {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
 				logEvent(db, "Secondary ISP powered on - scheduled restart completed")
+				// Update autorestart table with restart timestamp
+				updateLastRestartTime(db, 1, time.Now().Unix())
 			}
 			hasActions = true
 		}
@@ -323,8 +605,8 @@ func processGPIOLogic(db *sql.DB) {
 
 	// Only log states when there are actions
 	if hasActions {
-		fmt.Println("Primary ISP State:", primary)
-		fmt.Println("Secondary ISP State:", secondary)
+		logDebug("Primary ISP State: %+v", primary)
+		logDebug("Secondary ISP State: %+v", secondary)
 	}
 }
 
@@ -472,7 +754,19 @@ func updateISPPowerState(db *sql.DB, ispID int, powerState bool, uxtimeWhenOffRe
 
 func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im not sure if this is a bad idea
 	return func(w http.ResponseWriter, r *http.Request) {
-		//fmt.Printf("Received %s request to %s\n", r.Method, r.URL.Path)
+		// Log API requests at different levels based on type
+		if r.URL.RawQuery != "" {
+			// Frequent polling requests (ispstates, logs) at TRACE level
+			if strings.Contains(r.URL.RawQuery, "ispstates") {
+				logTrace("API: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			} else if strings.Contains(r.URL.RawQuery, "logs") || strings.Contains(r.URL.RawQuery, "networkstatus") {
+				logDebug("API: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			} else {
+				logDebug("API: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			}
+		} else {
+			logTrace("API: %s %s", r.Method, r.URL.Path)
+		}
 		var payload map[string]interface{}
 
 		if r.Method == "OPTIONS" {
@@ -610,35 +904,71 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 
 			} else if rowsRequested {
 				///////////////////////////////////////////
+				requestedRows := int(payload["Rows"].(float64))
+				logDebug("Querying ping data - requesting %d records", requestedRows)
+				
 				rows, err := db.Query("SELECT uxtimesec, cloudflare, google, facebook, x FROM pings ORDER BY uxtimesec DESC LIMIT ?", payload["Rows"])
 				if err != nil {
+					logError("Failed to query ping data: %v", err)
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
 				defer rows.Close()
 
-				result := make([]PingData, 0)
+				pingResults := make([]PingData, 0)
 
 				for rows.Next() {
 					var data PingData
 					err = rows.Scan(&data.Untimesec, &data.Cloudflare, &data.Google, &data.Facebook, &data.X)
 					if err != nil {
+						logError("Failed to scan ping row: %v", err)
 						http.Error(w, err.Error(), http.StatusInternalServerError)
 						return
 					}
-					result = append(result, data)
+					pingResults = append(pingResults, data)
+				}
+				
+				logTrace("Retrieved %d ping records (latest: %d, oldest: %d)", len(pingResults), 
+					func() int64 { if len(pingResults) > 0 { return pingResults[0].Untimesec } else { return 0 } }(),
+					func() int64 { if len(pingResults) > 0 { return pingResults[len(pingResults)-1].Untimesec } else { return 0 } }())
+
+				// Query restart times for both ISPs
+				logTrace("Querying ISP restart times")
+				var primaryLastRestart, secondaryLastRestart int64
+
+				err = db.QueryRow("SELECT last_restart_uxtimesec FROM isp_restart_times WHERE isp_id = 0").Scan(&primaryLastRestart)
+				if err != nil {
+					logDebug("Failed to query primary ISP last restart time: %v", err)
+					primaryLastRestart = 0
+				} else {
+					logTrace("Primary ISP last restart time: %d", primaryLastRestart)
+				}
+
+				err = db.QueryRow("SELECT last_restart_uxtimesec FROM isp_restart_times WHERE isp_id = 1").Scan(&secondaryLastRestart)
+				if err != nil {
+					logDebug("Failed to query secondary ISP last restart time: %v", err)
+					secondaryLastRestart = 0
+				} else {
+					logTrace("Secondary ISP last restart time: %d", secondaryLastRestart)
+				}
+
+				// Create response with ping data and restart times
+				response := map[string]interface{}{
+					"ping_data": pingResults,
+					"restart_times": map[string]int64{
+						"primary": primaryLastRestart,
+						"secondary": secondaryLastRestart,
+					},
 				}
 				/////////////////////////////////
-
-				//fmt.Println("++++++++++++++++++++++++")
 
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
 
-				json.NewEncoder(w).Encode(result)
+				json.NewEncoder(w).Encode(response)
 			} else if restartNowFound {
-				// Handle immediate ISP restart request
-				fmt.Println("Received restart now request with payload:", payload)
+				// Handle immediate ISP restart request  
+				logInfo("USER ACTION: Immediate ISP restart requested - payload: %v", payload)
 
 				// Extract ISP ID from payload
 				ispID, ok := payload["isp_id"].(float64)
@@ -648,6 +978,7 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				}
 
 				currentTime := time.Now().Unix()
+				logInfo("Updating ISP %d for immediate restart - setting powerstate=0, uxtimewhenoffrequested=%d", int(ispID), currentTime)
 
 				// Update database: set powerstate=0, uxtimewhenoffrequested=now, offuntiluxtimesec=0
 				err := retryDatabaseOperation(func() error {
@@ -662,11 +993,12 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				}, 3, 100*time.Millisecond)
 
 				if err != nil {
+					fmt.Printf("[DATABASE ERROR] Failed to update ISP %d for restart: %v\n", int(ispID), err)
 					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
 					return
 				}
 
-				fmt.Printf("ISP %d set for immediate restart\n", int(ispID))
+				fmt.Printf("[DATABASE] Successfully updated ISP %d for immediate restart\n", int(ispID))
 
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "text/plain")
@@ -692,6 +1024,8 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 
 				currentTime := time.Now().Unix()
 				offUntilTime := currentTime + (int64(durationMinutes) * 60) // Convert minutes to seconds
+				
+				fmt.Printf("[DATABASE] Updating ISP %d for timed restart - off for %.0f minutes (until timestamp %d)\n", int(ispID), durationMinutes, offUntilTime)
 
 				// Update database: set powerstate=0, times accordingly
 				err := retryDatabaseOperation(func() error {
@@ -706,11 +1040,12 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				}, 3, 100*time.Millisecond)
 
 				if err != nil {
+					fmt.Printf("[DATABASE ERROR] Failed to update ISP %d for timed restart: %v\n", int(ispID), err)
 					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
 					return
 				}
 
-				fmt.Printf("ISP %d set for restart, off for %.0f minutes (until %d)\n", int(ispID), durationMinutes, offUntilTime)
+				fmt.Printf("[DATABASE] Successfully updated ISP %d for timed restart\n", int(ispID))
 
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "text/plain")
@@ -733,34 +1068,67 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 
 			if autorestartQuery != "" {
 				// Handle get request for button state request data
+				fmt.Printf("[DATABASE] Querying autorestart settings from autorestart table\n")
+				
 				var autorestart Autorestart
 				err := db.QueryRow("SELECT ROWID, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth FROM autorestart WHERE ROWID = 0").
 					Scan(&autorestart.ROWID, &autorestart.Uxtimesec, &autorestart.Autorestart, &autorestart.Hour, &autorestart.Min, &autorestart.Sec, &autorestart.Daily, &autorestart.Weekly, &autorestart.Monthly, &autorestart.Dayinweek, &autorestart.Weekinmonth)
 				if err != nil {
+					fmt.Printf("[DATABASE ERROR] Failed to query autorestart settings: %v\n", err)
 					http.Error(w, fmt.Sprintf("Error fetching autorestart: %v", err), http.StatusInternalServerError)
 					return
 				}
+				
+				fmt.Printf("[DATABASE] Successfully retrieved autorestart settings: enabled=%d, schedule=%02d:%02d:%02d\n", autorestart.Autorestart, autorestart.Hour, autorestart.Min, autorestart.Sec)
+				
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
-				//fmt.Println("Sending autorestart data:", autorestart)
 				json.NewEncoder(w).Encode(autorestart)
 			} else if ispStatesQuery != "" {
-				// Handle ISP states request
+				// Handle ISP states request (most frequent - only log at TRACE level)
+				logTrace("Querying ISP states")
+				
 				var primaryState, secondaryState ISPState
 				
 				err := db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 0").
 					Scan(&primaryState.ISPID, &primaryState.PowerState, &primaryState.UxtimeWhenOffRequested, &primaryState.OffUntilUxtimesec)
-				if err != nil && err != sql.ErrNoRows {
-					http.Error(w, fmt.Sprintf("Error fetching primary ISP state: %v", err), http.StatusInternalServerError)
-					return
+				if err != nil {
+					if err == sql.ErrNoRows {
+						fmt.Printf("[DATABASE WARNING] Primary ISP (id=0) not found in database\n")
+						// Create default primary state
+						primaryState = ISPState{
+							ISPID: 0,
+							PowerState: true,
+							UxtimeWhenOffRequested: 0,
+							OffUntilUxtimesec: 0,
+						}
+					} else {
+						fmt.Printf("[DATABASE ERROR] Failed to query primary ISP state: %v\n", err)
+						http.Error(w, fmt.Sprintf("Error fetching primary ISP state: %v", err), http.StatusInternalServerError)
+						return
+					}
 				}
 				
 				err = db.QueryRow("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates WHERE ispid = 1").
 					Scan(&secondaryState.ISPID, &secondaryState.PowerState, &secondaryState.UxtimeWhenOffRequested, &secondaryState.OffUntilUxtimesec)
-				if err != nil && err != sql.ErrNoRows {
-					http.Error(w, fmt.Sprintf("Error fetching secondary ISP state: %v", err), http.StatusInternalServerError)
-					return
+				if err != nil {
+					if err == sql.ErrNoRows {
+						fmt.Printf("[DATABASE WARNING] Secondary ISP (id=1) not found in database\n")
+						// Create default secondary state
+						secondaryState = ISPState{
+							ISPID: 1,
+							PowerState: true,
+							UxtimeWhenOffRequested: 0,
+							OffUntilUxtimesec: 0,
+						}
+					} else {
+						fmt.Printf("[DATABASE ERROR] Failed to query secondary ISP state: %v\n", err)
+						http.Error(w, fmt.Sprintf("Error fetching secondary ISP state: %v", err), http.StatusInternalServerError)
+						return
+					}
 				}
+				
+				logTrace("Retrieved ISP states - Primary: power=%t, Secondary: power=%t", primaryState.PowerState, secondaryState.PowerState)
 				
 				response := map[string]interface{}{
 					"primary": primaryState,
@@ -772,12 +1140,15 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				json.NewEncoder(w).Encode(response)
 			} else if networkStatusQuery != "" {
 				// Handle network status request
+				fmt.Printf("[DATABASE] Querying network status from network_status table\n")
+				
 				var status NetworkStatus
 				
 				err := db.QueryRow("SELECT active_connection, public_ip, location, last_updated FROM network_status ORDER BY id DESC LIMIT 1").
 					Scan(&status.ActiveConnection, &status.PublicIP, &status.Location, &status.LastUpdated)
 				if err != nil {
 					if err == sql.ErrNoRows {
+						fmt.Printf("[DATABASE] No network status data found, using defaults\n")
 						// Return default values if no data
 						status = NetworkStatus{
 							ActiveConnection: "Unknown",
@@ -786,9 +1157,12 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 							LastUpdated:      time.Now().Unix(),
 						}
 					} else {
+						fmt.Printf("[DATABASE ERROR] Failed to query network status: %v\n", err)
 						http.Error(w, fmt.Sprintf("Error fetching network status: %v", err), http.StatusInternalServerError)
 						return
 					}
+				} else {
+					fmt.Printf("[DATABASE] Successfully retrieved network status: %s at %s\n", status.ActiveConnection, status.PublicIP)
 				}
 				
 				w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -801,8 +1175,11 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					limit = 10 // Default to 10 logs
 				}
 				
+				fmt.Printf("[DATABASE] Querying activity logs from logs table - Requesting %d most recent entries\n", limit)
+				
 				rows, err := db.Query("SELECT uxtimesec, reason FROM logs ORDER BY uxtimesec DESC LIMIT ?", limit)
 				if err != nil {
+					fmt.Printf("[DATABASE ERROR] Failed to query logs: %v\n", err)
 					http.Error(w, fmt.Sprintf("Error fetching logs: %v", err), http.StatusInternalServerError)
 					return
 				}
@@ -813,10 +1190,13 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					var log Log
 					err = rows.Scan(&log.Uxtimesec, &log.Reason)
 					if err != nil {
+						fmt.Printf("[DATABASE ERROR] Failed to scan log row: %v\n", err)
 						continue
 					}
 					logs = append(logs, log)
 				}
+				
+				fmt.Printf("[DATABASE] Successfully retrieved %d activity log entries\n", len(logs))
 				
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "application/json")
@@ -898,7 +1278,24 @@ func createTables(db *sql.DB) error {
 		);
 	`)
 
-	for _, err := range []error{err, err1, err2, err3} {
+	_, err4 := db.Exec(`
+		CREATE TABLE IF NOT EXISTS network_status (
+		    id INTEGER PRIMARY KEY,
+		    active_connection TEXT NOT NULL,
+		    public_ip TEXT NOT NULL,
+		    location TEXT NOT NULL,
+		    last_updated INTEGER NOT NULL
+		);
+	`)
+
+	_, err5 := db.Exec(`
+		CREATE TABLE IF NOT EXISTS isp_restart_times (
+		    isp_id TINYINT PRIMARY KEY,
+		    last_restart_uxtimesec INTEGER NOT NULL DEFAULT 0
+		);
+	`)
+
+	for _, err := range []error{err, err1, err2, err3, err4, err5} {
 		if err != nil {
 			return fmt.Errorf("error creating table: %v", err)
 		}
@@ -910,14 +1307,15 @@ func createTables(db *sql.DB) error {
 func PrintPingResults(db *sql.DB, pingResults chan map[string]int) {
 
 	for result := range pingResults {
-		//log.Println(result)
 		now := time.Now()
 		unixTimestamp := now.Unix()
-		//log.Println(unixTimestamp)
 		cloudflareMS := result["cloudflare"]
 		googleMS := result["google"]
 		facebookMS := result["facebook"]
 		xMS := result["x"]
+
+		logTrace("Inserting ping results: CF=%dms, Google=%dms, FB=%dms, X=%dms at %d", 
+			cloudflareMS, googleMS, facebookMS, xMS, unixTimestamp)
 
 		// Simple insert without retry for high-frequency ping data
 		query := `
@@ -926,7 +1324,9 @@ func PrintPingResults(db *sql.DB, pingResults chan map[string]int) {
 		`
 		_, err := db.Exec(query, unixTimestamp, cloudflareMS, googleMS, facebookMS, xMS)
 		if err != nil {
-			log.Printf("error inserting ping entry: %v", err)
+			logError("Failed to insert ping results: %v", err)
+		} else {
+			logTrace("Successfully inserted ping results")
 		}
 	}
 }
@@ -948,7 +1348,14 @@ func pingTest(pingResults chan map[string]int) {
 		results := make(map[string]int)
 
 		for website, ip := range pingThese {
-			cmd := exec.Command("ping", "-c", "1", ip) //change to -c on linux, and -n on windows
+			var cmd *exec.Cmd
+			
+			// Detect OS and use appropriate ping command
+			if runtime.GOOS == "windows" {
+				cmd = exec.Command("ping", "-n", "1", ip) // Windows uses -n for count
+			} else {
+				cmd = exec.Command("ping", "-c", "1", ip) // Linux/Mac use -c for count
+			}
 
 			output, err := cmd.CombinedOutput()
 			if err != nil {
@@ -956,35 +1363,73 @@ func pingTest(pingResults chan map[string]int) {
 				continue
 			}
 			//log.Println(string(output))
-			for _, word := range strings.Split(string(output), " ") {
-				if strings.Contains(word, "time") {
-					digits := ""
-					decimal := ""
-					dotFound := false
-					for _, char := range word {
-						if char == '.' {
-							dotFound = true
-						} else if char >= '0' && char <= '9' {
-							if !dotFound {
-								digits += string(char)
+			
+			// Parse ping output based on OS
+			var latency float64
+			var found bool
+			
+			if runtime.GOOS == "windows" {
+				// Windows format: "Reply from x.x.x.x: bytes=32 time=10ms TTL=64"
+				lines := strings.Split(string(output), "\n")
+				for _, line := range lines {
+					if strings.Contains(line, "time=") && strings.Contains(line, "ms") {
+						// Extract time value
+						parts := strings.Split(line, "time=")
+						if len(parts) > 1 {
+							timePart := strings.Split(parts[1], "ms")[0]
+							timePart = strings.TrimSpace(timePart)
+							// Handle "<1" case for very low latencies
+							if strings.Contains(timePart, "<") {
+								latency = 1.0
+								found = true
 							} else {
-								decimal += string(char)
+								if val, err := strconv.ParseFloat(timePart, 64); err == nil {
+									latency = val
+									found = true
+								}
+							}
+							break
+						}
+					}
+				}
+			} else {
+				// Linux format: "64 bytes from x.x.x.x: icmp_seq=1 ttl=64 time=10.5 ms"
+				for _, word := range strings.Split(string(output), " ") {
+					if strings.Contains(word, "time") {
+						digits := ""
+						decimal := ""
+						dotFound := false
+						for _, char := range word {
+							if char == '.' {
+								dotFound = true
+							} else if char >= '0' && char <= '9' {
+								if !dotFound {
+									digits += string(char)
+								} else {
+									decimal += string(char)
+								}
+							}
+						}
+						if timeStr := digits + "." + decimal; timeStr != "." {
+							if val, err := strconv.ParseFloat(timeStr, 64); err == nil {
+								latency = val
+								found = true
+								break
 							}
 						}
 					}
-					time, err := strconv.ParseFloat(digits+"."+decimal, 64)
-					if err != nil {
-						fmt.Println(err)
-						continue
-					}
-					roundedTime := int(math.Round(time))
-					if roundedTime < 32000 {
-						results[website] = roundedTime
-					} else {
-						results[website] = -2
-					}
-					break
 				}
+			}
+			
+			if found {
+				roundedTime := int(math.Round(latency))
+				if roundedTime < 32000 {
+					results[website] = roundedTime
+				} else {
+					results[website] = -2
+				}
+			} else {
+				results[website] = -1
 			}
 		}
 
@@ -1156,4 +1601,552 @@ func logEvent(db *sql.DB, reason string) error {
 		_, err := db.Exec("INSERT INTO logs (uxtimesec, reason) VALUES (?, ?)", currentTime, reason)
 		return err
 	}, 3, 100*time.Millisecond)
+}
+
+// Interactive command-line interface for testing ISP state changes
+func startCommandInterface(db *sql.DB) {
+	if console.terminalMode {
+		// Use raw terminal input mode
+		startTerminalInput(db)
+	} else {
+		// Use simple line-based input mode
+		startSimpleInput(db)
+	}
+}
+
+func startSimpleInput(db *sql.DB) {
+	reader := bufio.NewReader(os.Stdin)
+	
+	for {
+		fmt.Print("\n[CMD] Enter command (help for list): ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("[CMD ERROR] Error reading input: %v\n", err)
+			continue
+		}
+		
+		command := strings.TrimSpace(input)
+		if command != "" {
+			processCommand(db, command)
+		}
+	}
+}
+
+func startTerminalInput(db *sql.DB) {
+	// Set stdin to raw mode for character-by-character input
+	if runtime.GOOS == "windows" {
+		startSimpleInput(db) // Fallback for Windows
+		return
+	}
+	
+	// Disable line buffering and echo
+	exec.Command("stty", "-echo", "cbreak").Run()
+	defer exec.Command("stty", "echo", "-cbreak").Run()
+	
+	reader := bufio.NewReader(os.Stdin)
+	
+	for {
+		char, err := reader.ReadByte()
+		if err != nil {
+			logError("Error reading terminal input: %v", err)
+			break
+		}
+		
+		console.Lock()
+		
+		switch char {
+		case 13, 10: // Enter key
+			if len(console.currentInput) > 0 {
+				command := strings.TrimSpace(console.currentInput)
+				console.currentInput = ""
+				console.cursorPos = 0
+				console.Unlock()
+				
+				if command == "exit" || command == "quit" {
+					cleanupTerminal()
+					os.Exit(0)
+				}
+				
+				processCommand(db, command)
+			} else {
+				console.Unlock()
+			}
+			
+		case 127, 8: // Backspace
+			if console.cursorPos > 0 {
+				console.currentInput = console.currentInput[:console.cursorPos-1] + console.currentInput[console.cursorPos:]
+				console.cursorPos--
+			}
+			console.Unlock()
+			
+		case 3: // Ctrl+C
+			console.Unlock()
+			cleanupTerminal()
+			os.Exit(0)
+			
+		case 27: // Escape sequence (arrow keys, etc.)
+			console.Unlock()
+			handleEscapeSequence(reader)
+			
+		default:
+			if char >= 32 && char <= 126 { // Printable characters
+				console.currentInput = console.currentInput[:console.cursorPos] + string(char) + console.currentInput[console.cursorPos:]
+				console.cursorPos++
+			}
+			console.Unlock()
+		}
+		
+		if console.terminalMode {
+			drawInputArea()
+		}
+	}
+}
+
+func handleEscapeSequence(reader *bufio.Reader) {
+	// Read the rest of the escape sequence
+	next, _ := reader.ReadByte()
+	if next == '[' {
+		final, _ := reader.ReadByte()
+		console.Lock()
+		defer console.Unlock()
+		
+		switch final {
+		case 'D': // Left arrow
+			if console.cursorPos > 0 {
+				console.cursorPos--
+			}
+		case 'C': // Right arrow  
+			if console.cursorPos < len(console.currentInput) {
+				console.cursorPos++
+			}
+		case 'A': // Up arrow - could implement command history
+		case 'B': // Down arrow - could implement command history
+		}
+	}
+}
+
+func processCommand(db *sql.DB, command string) {
+	parts := strings.Fields(command)
+	
+	if len(parts) == 0 {
+		return
+	}
+	
+	switch strings.ToLower(parts[0]) {
+	case "help":
+		printHelp()
+		
+	case "status":
+		showISPStatus(db)
+	
+	case "loglevel":
+		if len(parts) != 2 {
+			logInfo("Current log level: %s", logLevelNames[console.logLevel])
+			logInfo("Usage: loglevel <level>")
+			logInfo("Available levels: SILENT, ERROR, WARN, INFO, DEBUG, TRACE")
+			return
+		}
+		setLogLevel(strings.ToUpper(parts[1]))
+	
+	case "logs":
+		showRecentLogs()
+	
+	case "flush":
+		// Force flush buffered logs in simple mode
+		if !console.terminalMode {
+			console.RLock()
+			logs := make([]string, len(console.outputBuffer))
+			copy(logs, console.outputBuffer)
+			console.RUnlock()
+			
+			fmt.Printf("\n[FLUSH] Showing %d buffered log entries:\n", len(logs))
+			start := 0
+			if len(logs) > 50 {  // Show last 50 entries
+				start = len(logs) - 50
+			}
+			for i := start; i < len(logs); i++ {
+				fmt.Println(logs[i])
+			}
+			fmt.Println("[FLUSH] End of buffered logs\n")
+		} else {
+			logInfo("Flush command only works in simple mode")
+		}
+	
+	case "clear":
+		if console.terminalMode {
+			console.Lock()
+			console.outputBuffer = []string{}
+			console.Unlock()
+			redrawTerminal()
+		} else {
+			fmt.Print("\033[2J\033[H") // Clear screen in simple mode
+		}
+	
+	case "ui":
+		if len(parts) > 1 && strings.ToLower(parts[1]) == "simple" {
+			// Switch to simple mode
+			if console.terminalMode {
+				cleanupTerminal()
+				console.Lock()
+				console.terminalMode = false
+				console.Unlock()
+				logInfo("Switched to simple UI mode")
+			}
+		} else {
+			logInfo("Current UI mode: %s", func() string {
+				if console.terminalMode { return "terminal" } else { return "simple" }
+			}())
+			logInfo("Usage: ui simple - switch to simple mode")
+		}
+		
+	case "set":
+		if len(parts) != 3 {
+			logInfo("Usage: set <isp_id> <on|off>")
+			logInfo("Example: set 0 off")
+			return
+		}
+		
+		ispID, err := strconv.Atoi(parts[1])
+		if err != nil || (ispID != 0 && ispID != 1) {
+			logInfo("Error: ISP ID must be 0 (primary) or 1 (secondary)")
+			return
+		}
+		
+		var powerState bool
+		switch strings.ToLower(parts[2]) {
+		case "on", "true", "1":
+			powerState = true
+		case "off", "false", "0":
+			powerState = false
+		default:
+			logInfo("Error: State must be 'on' or 'off'")
+			return
+		}
+		
+		setISPState(db, ispID, powerState)
+		
+	case "restart":
+		if len(parts) < 2 {
+			logInfo("Usage: restart <isp_id> [duration_minutes]")
+			logInfo("Example: restart 0 5")
+			return
+		}
+		
+		ispID, err := strconv.Atoi(parts[1])
+		if err != nil || (ispID != 0 && ispID != 1) {
+			logInfo("Error: ISP ID must be 0 (primary) or 1 (secondary)")
+			return
+		}
+		
+		var duration int
+		if len(parts) >= 3 {
+			duration, err = strconv.Atoi(parts[2])
+			if err != nil {
+				logInfo("Error: Duration must be a number (minutes)")
+				return
+			}
+		}
+		
+		restartISP(db, ispID, duration)
+		
+	case "setrestart":
+		if len(parts) != 3 {
+			logInfo("Usage: setrestart <isp_id> <unix_timestamp>")
+			logInfo("Example: setrestart 0 1640995200")
+			logInfo("Use 0 for timestamp to clear restart time")
+			return
+		}
+		
+		ispID, err := strconv.Atoi(parts[1])
+		if err != nil || (ispID != 0 && ispID != 1) {
+			logInfo("Error: ISP ID must be 0 (primary) or 1 (secondary)")
+			return
+		}
+		
+		restartTime, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			logInfo("Error: Timestamp must be a valid Unix timestamp")
+			return
+		}
+		
+		setRestartTime(db, ispID, restartTime)
+			
+	case "exit", "quit":
+		if console.terminalMode {
+			cleanupTerminal()
+		}
+		logInfo("Command interface disabled")
+		os.Exit(0)
+		
+	default:
+		logInfo("Unknown command: %s", parts[0])
+		logInfo("Type 'help' for available commands")
+	}
+}
+
+func printHelp() {
+	// Use direct printing to avoid potential deadlocks with the logging system
+	helpText := `
+Available commands:
+  help                        - Show this help message
+  status                      - Show current ISP states
+  loglevel [level]           - Show/set log level (SILENT/ERROR/WARN/INFO/DEBUG/TRACE)
+  logs                        - Show recent log entries
+  flush                       - Show buffered logs (simple mode only)
+  clear                       - Clear output buffer
+  ui [simple]                - Show UI mode or switch to simple mode
+  set <id> <on|off>          - Set ISP power state (id: 0=primary, 1=secondary)
+  restart <id> [minutes]     - Restart ISP for specified duration (0=immediate)
+  setrestart <id> <timestamp> - Set last restart time for testing uptime clocks
+  exit                        - Exit program
+
+Log Levels:
+  SILENT - No output
+  ERROR  - Only errors and critical events
+  WARN   - Warnings and above
+  INFO   - Important events (user actions, restarts) [DEFAULT]
+  DEBUG  - Detailed info (some API calls)
+  TRACE  - All output (everything)
+
+Examples:
+  loglevel INFO              - Reset to default level (recommended for Windows)
+  loglevel WARN              - Reduce noise, only warnings and errors
+  flush                      - Show buffered DEBUG/TRACE messages
+  set 0 off                  - Turn off primary ISP
+  restart 0 5                - Restart primary ISP for 5 minutes
+`
+	fmt.Print(helpText)
+}
+
+func showISPStatus(db *sql.DB) {
+	err := retryDatabaseOperation(func() error {
+		rows, err := db.Query("SELECT ispid, powerstate, uxtimewhenoffrequested, offuntiluxtimesec FROM ispstates ORDER BY ispid")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		
+		fmt.Println("\n[CMD] Current ISP States:")
+		fmt.Println("ID | Name      | Power | Off Requested | Off Until")
+		fmt.Println("---|-----------|-------|---------------|----------")
+		
+		for rows.Next() {
+			var ispid int
+			var powerstate int
+			var offrequested int64
+			var offuntil int64
+			
+			err := rows.Scan(&ispid, &powerstate, &offrequested, &offuntil)
+			if err != nil {
+				return err
+			}
+			
+			name := "Primary"
+			if ispid == 1 {
+				name = "Secondary"
+			}
+			
+			power := "OFF"
+			if powerstate == 1 {
+				power = "ON"
+			}
+			
+			offReqStr := "None"
+			if offrequested > 0 {
+				offReqStr = time.Unix(offrequested, 0).Format("15:04:05")
+			}
+			
+			offUntilStr := "None"
+			if offuntil > 0 {
+				offUntilStr = time.Unix(offuntil, 0).Format("15:04:05")
+			}
+			
+			fmt.Printf("%d  | %-9s | %-5s | %-13s | %s\n", ispid, name, power, offReqStr, offUntilStr)
+		}
+		
+		return rows.Err()
+	}, 3, 100*time.Millisecond)
+	
+	if err != nil {
+		fmt.Printf("[CMD ERROR] Failed to fetch ISP status: %v\n", err)
+	}
+}
+
+func setISPState(db *sql.DB, ispID int, powerState bool) {
+	ispName := "Primary"
+	if ispID == 1 {
+		ispName = "Secondary"
+	}
+	
+	powerStateInt := 0
+	if powerState {
+		powerStateInt = 1
+	}
+	
+	err := retryDatabaseOperation(func() error {
+		_, err := db.Exec(`
+			UPDATE ispstates 
+			SET powerstate = ?, 
+			    uxtimewhenoffrequested = 0, 
+			    offuntiluxtimesec = 0 
+			WHERE ispid = ?`,
+			powerStateInt, ispID)
+		return err
+	}, 3, 100*time.Millisecond)
+	
+	if err != nil {
+		fmt.Printf("[CMD ERROR] Failed to update %s ISP state: %v\n", ispName, err)
+		return
+	}
+	
+	stateStr := "OFF"
+	if powerState {
+		stateStr = "ON"
+	}
+	
+	fmt.Printf("[CMD] %s ISP set to %s\n", ispName, stateStr)
+	
+	// Log the manual change
+	reason := fmt.Sprintf("Manual command: %s ISP set to %s", ispName, stateStr)
+	logEvent(db, reason)
+}
+
+func restartISP(db *sql.DB, ispID int, durationMinutes int) {
+	ispName := "Primary"
+	if ispID == 1 {
+		ispName = "Secondary"
+	}
+	
+	currentTime := time.Now().Unix()
+	var offUntilTime int64
+	
+	if durationMinutes > 0 {
+		offUntilTime = currentTime + int64(durationMinutes*60)
+	}
+	
+	err := retryDatabaseOperation(func() error {
+		_, err := db.Exec(`
+			UPDATE ispstates 
+			SET powerstate = 0, 
+			    uxtimewhenoffrequested = ?, 
+			    offuntiluxtimesec = ? 
+			WHERE ispid = ?`,
+			currentTime, offUntilTime, ispID)
+		return err
+	}, 3, 100*time.Millisecond)
+	
+	if err != nil {
+		fmt.Printf("[CMD ERROR] Failed to restart %s ISP: %v\n", ispName, err)
+		return
+	}
+	
+	if durationMinutes > 0 {
+		fmt.Printf("[CMD] %s ISP restarted for %d minutes (until %s)\n", 
+			ispName, durationMinutes, time.Unix(offUntilTime, 0).Format("15:04:05"))
+	} else {
+		fmt.Printf("[CMD] %s ISP restarted immediately\n", ispName)
+	}
+	
+	// Log the manual restart
+	reason := fmt.Sprintf("Manual command: %s ISP restart", ispName)
+	if durationMinutes > 0 {
+		reason += fmt.Sprintf(" for %d minutes", durationMinutes)
+	} else {
+		reason += " immediately"
+	}
+	logEvent(db, reason)
+}
+
+// Set restart time for testing purposes
+func setRestartTime(db *sql.DB, ispID int, restartTime int64) {
+	ispName := "Primary"
+	if ispID == 1 {
+		ispName = "Secondary"
+	}
+	
+	err := retryDatabaseOperation(func() error {
+		_, err := db.Exec(`
+			INSERT OR REPLACE INTO isp_restart_times (isp_id, last_restart_uxtimesec) 
+			VALUES (?, ?)`,
+			ispID, restartTime)
+		return err
+	}, 3, 100*time.Millisecond)
+	
+	if err != nil {
+		fmt.Printf("[CMD ERROR] Failed to set %s ISP restart time: %v\n", ispName, err)
+		return
+	}
+	
+	if restartTime == 0 {
+		fmt.Printf("[CMD] %s ISP restart time cleared\n", ispName)
+	} else {
+		fmt.Printf("[CMD] %s ISP restart time set to %d (%s)\n", ispName, restartTime, 
+			time.Unix(restartTime, 0).Format("2006-01-02 15:04:05"))
+	}
+	
+	// Log the manual change
+	reason := fmt.Sprintf("Manual command: %s ISP restart time set to %d", ispName, restartTime)
+	logEvent(db, reason)
+}
+
+// Update last restart time for an ISP - using a separate table for tracking restart times
+func updateLastRestartTime(db *sql.DB, ispID int, restartTime int64) error {
+	return retryDatabaseOperation(func() error {
+		// Insert or update the restart time record
+		_, err := db.Exec(`
+			INSERT OR REPLACE INTO isp_restart_times (isp_id, last_restart_uxtimesec) 
+			VALUES (?, ?)`,
+			ispID, restartTime)
+		return err
+	}, 3, 100*time.Millisecond)
+}
+
+// Set log level command
+func setLogLevel(levelStr string) {
+	var newLevel LogLevel
+	var found bool
+	
+	for level, name := range logLevelNames {
+		if name == levelStr {
+			newLevel = level
+			found = true
+			break
+		}
+	}
+	
+	if !found {
+		logInfo("Invalid log level: %s", levelStr)
+		logInfo("Available levels: SILENT, ERROR, WARN, INFO, DEBUG, TRACE")
+		return
+	}
+	
+	console.Lock()
+	oldLevel := console.logLevel
+	console.logLevel = newLevel
+	console.Unlock()
+	
+	logInfo("Log level changed from %s to %s", logLevelNames[oldLevel], logLevelNames[newLevel])
+}
+
+// Show recent logs command
+func showRecentLogs() {
+	console.RLock()
+	logs := make([]string, len(console.outputBuffer))
+	copy(logs, console.outputBuffer)
+	console.RUnlock()
+	
+	logInfo("")
+	logInfo("Recent logs (last %d entries, level: %s):", len(logs), logLevelNames[console.logLevel])
+	logInfo("=====================================")
+	
+	// Show last 20 entries
+	start := 0
+	if len(logs) > 20 {
+		start = len(logs) - 20
+	}
+	
+	for i := start; i < len(logs); i++ {
+		logInfo("%s", logs[i])
+	}
+	logInfo("=====================================")
 }
