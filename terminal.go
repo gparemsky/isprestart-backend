@@ -38,6 +38,10 @@ func (cache *ISPStateCache) isStale(maxAge time.Duration) bool {
 
 // Terminal control functions
 func initTerminal() {
+	// TEMPORARY FIX: Force simple mode to avoid terminal clearing issues
+	console.terminalMode = false
+	return
+	
 	if runtime.GOOS == "windows" {
 		// On Windows, use simple mode
 		console.terminalMode = false
@@ -455,6 +459,19 @@ func processCommand(db *sql.DB, command string) {
 			redrawTerminal()
 		}
 		
+	case "setip":
+		if len(parts) < 2 {
+			logError("Usage: setip <ip_address>")
+			return
+		}
+		newIP := parts[1]
+		err := updateServerIP(db, newIP)
+		if err != nil {
+			logError("Failed to update server IP: %v", err)
+		} else {
+			logInfo("Server IP updated to: %s (restart required to take effect)", newIP)
+		}
+		
 	case "exit", "quit":
 		logInfo("Shutting down...")
 		cleanupTerminal()
@@ -474,6 +491,7 @@ func printHelp() {
 	logInfo("  restart <isp1|isp2> [duration_minutes] - Restart ISP for specified duration (default 5 min)")
 	logInfo("  loglevel <level> - Set log level (silent|error|warn|info|debug|trace)")
 	logInfo("  logs           - Show recent log entries")
+	logInfo("  setip <ip>     - Update server IP address (requires restart)")
 	logInfo("  clear          - Clear console output")
 	logInfo("  exit/quit      - Exit the program")
 }

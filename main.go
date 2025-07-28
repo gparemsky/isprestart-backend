@@ -8,6 +8,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"net/http"
 	"runtime"
@@ -43,6 +44,16 @@ func main() {
 
 	logInfo("Database initialized successfully")
 
+	// Get server configuration
+	serverConfig, err := getServerConfig(db)
+	if err != nil {
+		logError("Failed to get server configuration: %v", err)
+		log.Fatal(err)
+	}
+	
+	serverAddress := fmt.Sprintf(":%d", serverConfig.ServerPort)
+	logInfo("Server configured - IP: %s, Port: %d", serverConfig.ServerIP, serverConfig.ServerPort)
+
 	go startGPIOlogic(db)
 	
 	// Initialize terminal UI
@@ -57,15 +68,15 @@ func main() {
 	go periodicWALCheckpoint(db)         // periodic WAL checkpoint to prevent infinite growth
 	go monitorNetworkStatus(db)          // monitor network status every minute
 
-	http.HandleFunc("/api/ping-data", pingDataHandler(db))
+	http.HandleFunc("/api/ping-data", corsMiddleware(pingDataHandler(db)))
 
-	logInfo("Server listening on port 8081")
+	logInfo("Server listening on %s (http://%s%s)", serverAddress, serverConfig.ServerIP, serverAddress)
 	logInfo("Command interface available - type 'help' for commands")
 	logInfo("Default log level: %s (use 'loglevel <level>' to change)", logLevelNames[console.logLevel])
 	
 	// Start HTTP server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(":8081", nil); err != nil {
+		if err := http.ListenAndServe(serverAddress, nil); err != nil {
 			logError("Failed to start HTTP server: %v", err)
 		}
 	}()

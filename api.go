@@ -10,6 +10,26 @@ import (
 	"time"
 )
 
+// CORS middleware to handle cross-origin requests
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers for all requests
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
+		
+		// Handle preflight OPTIONS request
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		// Call the next handler
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Helper function to send error responses with CORS headers
 func corsError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")

@@ -122,7 +122,15 @@ func createTables(db *sql.DB) error {
 		);
 	`)
 
-	for _, err := range []error{err, err1, err2, err3, err4, err5} {
+	_, err6 := db.Exec(`
+		CREATE TABLE IF NOT EXISTS server_settings (
+		    key TEXT PRIMARY KEY,
+		    value TEXT NOT NULL,
+		    updated_at INTEGER NOT NULL
+		);
+	`)
+
+	for _, err := range []error{err, err1, err2, err3, err4, err5, err6} {
 		if err != nil {
 			return fmt.Errorf("error creating table: %v", err)
 		}
