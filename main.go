@@ -339,11 +339,11 @@ var DOW = map[string]int{
 }
 
 type PingData struct {
-	Untimesec  int64  `json:"untimesec"`
-	Cloudflare uint16 `json:"cloudflare"`
-	Google     uint16 `json:"google"`
-	Facebook   uint16 `json:"facebook"`
-	X          uint16 `json:"x"`
+	Untimesec  int64 `json:"untimesec"`
+	Cloudflare int16 `json:"cloudflare"`
+	Google     int16 `json:"google"`
+	Facebook   int16 `json:"facebook"`
+	X          int16 `json:"x"`
 }
 
 type Autorestart struct {
@@ -372,8 +372,13 @@ type NetworkStatus struct {
 }
 
 type Log struct {
-	Uxtimesec int64  `json:"uxtimesec"`
-	Reason    string `json:"reason"`
+	Uxtimesec       int64  `json:"uxtimesec"`
+	Reason          string `json:"reason"`
+	IspID           *int   `json:"isp_id,omitempty"`
+	IspName         *string `json:"isp_name,omitempty"`
+	RestartType     *string `json:"restart_type,omitempty"`
+	DurationMinutes *int   `json:"duration_minutes,omitempty"`
+	ClientIP        *string `json:"client_ip,omitempty"`
 }
 
 type ServerResponse struct {
@@ -419,6 +424,7 @@ func main() {
 	go pingTest(pingChannel)             // start pinging
 	go PrintPingResults(db, pingChannel) // save ping results to db
 	go retriveSettings(db)               // start retrieving settings or save default values to db
+	go periodicWALCheckpoint(db)         // periodic WAL checkpoint to prevent infinite growth
 
 	http.HandleFunc("/api/ping-data", pingDataHandler(db))
 
@@ -476,9 +482,18 @@ func processGPIOLogic(db *sql.DB) {
 		return
 	}
 
+	// Debug logging for ISP states (only when actions are needed)
+	if (!primary.PowerState && primary.OffUntilUxtimesec == 0) || (!secondary.PowerState && secondary.OffUntilUxtimesec == 0) ||
+	   (primary.PowerState && primary.UxtimeWhenOffRequested > 0) || (secondary.PowerState && secondary.UxtimeWhenOffRequested > 0) {
+		fmt.Printf("[DEBUG] GPIO Processing - Primary: PowerState=%t, OffUntil=%d, OffRequested=%d, Secondary: PowerState=%t, OffUntil=%d, OffRequested=%d\n", 
+			primary.PowerState, primary.OffUntilUxtimesec, primary.UxtimeWhenOffRequested, 
+			secondary.PowerState, secondary.OffUntilUxtimesec, secondary.UxtimeWhenOffRequested)
+	}
+
 	// Reduced logging - only log when there are actual actions to take
 	currentTime := time.Now().Unix()
 	hasActions := false
+	needsCacheRefresh := false
 
 	// PRIMARY ISP LOGIC
 	if !primary.PowerState { // Primary ISP is currently OFF
@@ -498,9 +513,11 @@ func processGPIOLogic(db *sql.DB) {
 				logError("Error updating primary ISP power state: %v", err)
 			} else {
 				logInfo("Primary ISP state updated in database: ON")
-				logEvent(db, "Primary ISP restarted - immediate restart completed")
+				logEvent(db, "[SYSTEM] Primary ISP restarted - immediate restart completed")
 				// Update autorestart table with restart timestamp
 				updateLastRestartTime(db, 0, time.Now().Unix())
+				
+				needsCacheRefresh = true
 			}
 			hasActions = true
 
@@ -519,9 +536,11 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating primary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Primary ISP state updated in database: ON\n")
-				logEvent(db, "Primary ISP powered on - scheduled restart completed")
+				logEvent(db, "[SYSTEM] Primary ISP powered on - scheduled restart completed")
 				// Update autorestart table with restart timestamp
 				updateLastRestartTime(db, 0, time.Now().Unix())
+				
+				needsCacheRefresh = true
 			}
 			hasActions = true
 
@@ -541,7 +560,15 @@ func processGPIOLogic(db *sql.DB) {
 
 		// Database update happens via cache refresh, no need to update here
 		hasActions = true
-		logEvent(db, "Primary ISP restart requested - turning off")
+		logEvent(db, "[SYSTEM] Primary ISP restart requested - turning off")
+	}
+
+	// If we need to refresh cache, do it now before processing secondary ISP
+	if needsCacheRefresh {
+		refreshISPStateCache(db)
+		// Re-read the secondary state after cache refresh
+		_, secondary, _ = ispStateCache.getStates()
+		needsCacheRefresh = false
 	}
 
 	// SECONDARY ISP LOGIC (same pattern as primary)
@@ -549,7 +576,7 @@ func processGPIOLogic(db *sql.DB) {
 
 		if secondary.OffUntilUxtimesec == 0 {
 			// IMMEDIATE RESTART CASE
-			fmt.Printf("Secondary ISP immediate restart - turning ON\n")
+			fmt.Printf("Secondary ISP immediate restart - turning ON (PowerState: %t, OffUntil: %d)\n", secondary.PowerState, secondary.OffUntilUxtimesec)
 
 			// GPIO: Turn secondary ISP back ON (placeholder)
 			// TODO: Replace with actual GPIO library calls
@@ -562,9 +589,11 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating secondary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
-				logEvent(db, "Secondary ISP restarted - immediate restart completed")
+				logEvent(db, "[SYSTEM] Secondary ISP restarted - immediate restart completed")
 				// Update autorestart table with restart timestamp
 				updateLastRestartTime(db, 1, time.Now().Unix())
+				
+				needsCacheRefresh = true
 			}
 			hasActions = true
 
@@ -583,9 +612,11 @@ func processGPIOLogic(db *sql.DB) {
 				fmt.Printf("Error updating secondary ISP power state: %v\n", err)
 			} else {
 				fmt.Printf("Secondary ISP state updated in database: ON\n")
-				logEvent(db, "Secondary ISP powered on - scheduled restart completed")
+				logEvent(db, "[SYSTEM] Secondary ISP powered on - scheduled restart completed")
 				// Update autorestart table with restart timestamp
 				updateLastRestartTime(db, 1, time.Now().Unix())
+				
+				needsCacheRefresh = true
 			}
 			hasActions = true
 		}
@@ -600,7 +631,12 @@ func processGPIOLogic(db *sql.DB) {
 		fmt.Printf("GPIO: Secondary ISP pin set to LOW (OFF)\n")
 
 		hasActions = true
-		logEvent(db, "Secondary ISP restart requested - turning off")
+		logEvent(db, "[SYSTEM] Secondary ISP restart requested - turning off")
+	}
+
+	// Refresh cache at the end if needed
+	if needsCacheRefresh {
+		refreshISPStateCache(db)
 	}
 
 	// Only log states when there are actions
@@ -752,6 +788,13 @@ func updateISPPowerState(db *sql.DB, ispID int, powerState bool, uxtimeWhenOffRe
 	}, 3, 100*time.Millisecond)
 }
 
+// Helper function to send error responses with CORS headers
+func corsError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "text/plain")
+	http.Error(w, message, code)
+}
+
 func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im not sure if this is a bad idea
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Log API requests at different levels based on type
@@ -780,7 +823,7 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 			//fmt.Println("Received POST request with payload:", r.Body)
 			err := json.NewDecoder(r.Body).Decode(&payload)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				corsError(w, err.Error(), http.StatusBadRequest)
 				fmt.Println("Error decoding JSON payload:", err)
 				fmt.Println("Payload:", payload)
 				return
@@ -797,18 +840,152 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 			_, restartForFound := payload["restartfor"] // payload will be like {"restartfor": 150, "isp_id": 0}
 
 			if autorestartFound {
-				// handle autorestart request here where the toggle button is turned off
-				//fmt.Println("Autorestart found:", autorestartFound)
-				//fmt.Println("Received autorestart request with payload:", payload["autorestart"])
-				if payload["autorestart"] == false || payload["autorestart"] == 0 {
-					_, err = db.Exec("UPDATE autorestart SET autorestart = ?, hour=?, min=?, sec=?, daily=?, weekly=?, monthly=?, dayinweek=?, weekinmonth=? WHERE ROWID = 0", payload["autorestart"], 0, 0, 0, 0, 0, 0, 0, 0)
-					if err != nil {
-						http.Error(w, err.Error(), http.StatusInternalServerError)
-						return
+				// handle autorestart request here where the toggle button is turned off/on
+				logInfo("USER ACTION: Autorestart toggle changed - payload: %v", payload)
+				
+				// Extract ISP ID from payload (default to primary ISP if not specified)
+				ispID := 0
+				if ispIDVal, ok := payload["isp_id"]; ok {
+					if ispIDFloat, ok := ispIDVal.(float64); ok {
+						ispID = int(ispIDFloat)
 					}
-					fmt.Println("Autorestart turned off")
 				}
-
+				
+				// Extract autorestart value
+				autorestartValue := 0
+				if autorestartVal := payload["autorestart"]; autorestartVal != nil {
+					switch v := autorestartVal.(type) {
+					case bool:
+						if v {
+							autorestartValue = 1
+						}
+					case float64:
+						autorestartValue = int(v)
+					}
+				}
+				
+				logInfo("Updating autorestart for ISP %d to %d", ispID, autorestartValue)
+				
+				// Update autorestart settings for the specified ISP
+				err := retryDatabaseOperation(func() error {
+					// First ensure the row exists for this ISP
+					var count int
+					err := db.QueryRow("SELECT COUNT(*) FROM autorestart WHERE isp_id = ?", ispID).Scan(&count)
+					if err != nil {
+						return err
+					}
+					
+					var existingSettings Autorestart
+					
+					if count == 0 {
+						// Row doesn't exist, create it first
+						_, err := db.Exec(`
+							INSERT INTO autorestart 
+							(isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth) 
+							VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
+							ispID, time.Now().Unix())
+						if err != nil {
+							return fmt.Errorf("failed to create autorestart row for ISP %d: %v", ispID, err)
+						}
+						logInfo("Created autorestart row for ISP %d", ispID)
+						
+						// Set default values since we just created the row
+						existingSettings.Hour = 0
+						existingSettings.Min = 0
+						existingSettings.Sec = 0
+						existingSettings.Daily = 0
+						existingSettings.Weekly = 0
+						existingSettings.Monthly = 0
+						existingSettings.Dayinweek = 0
+						existingSettings.Weekinmonth = 0
+					} else {
+						// Row exists, read current settings
+						err := db.QueryRow("SELECT hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth FROM autorestart WHERE isp_id = ?", ispID).
+							Scan(&existingSettings.Hour, &existingSettings.Min, &existingSettings.Sec, &existingSettings.Daily, &existingSettings.Weekly, &existingSettings.Monthly, &existingSettings.Dayinweek, &existingSettings.Weekinmonth)
+						if err != nil {
+							return fmt.Errorf("failed to read existing settings for ISP %d: %v", ispID, err)
+						}
+					}
+					
+					if autorestartValue == 0 {
+						// When turning OFF autorestart, clear all schedule settings
+						_, err := db.Exec(`
+							UPDATE autorestart 
+							SET uxtimesec = ?, autorestart = 0, hour = 0, min = 0, sec = 0, 
+							    daily = 0, weekly = 0, monthly = 0, dayinweek = 0, weekinmonth = 0
+							WHERE isp_id = ?`,
+							time.Now().Unix(), ispID)
+						return err
+					} else {
+						// When turning ON autorestart, preserve existing schedule settings
+						// If no schedule is configured, set default to daily at midnight
+						if existingSettings.Daily == 0 && existingSettings.Weekly == 0 && existingSettings.Monthly == 0 {
+							existingSettings.Daily = 1
+							existingSettings.Hour = 0
+							existingSettings.Min = 0
+							existingSettings.Sec = 0
+							logInfo("No schedule configured for ISP %d, setting default daily at midnight", ispID)
+						}
+						
+						// Update existing row, preserve/set schedule settings
+						_, err = db.Exec(`
+							UPDATE autorestart 
+							SET uxtimesec = ?, autorestart = 1, hour = ?, min = ?, sec = ?, 
+							    daily = ?, weekly = ?, monthly = ?, dayinweek = ?, weekinmonth = ?
+							WHERE isp_id = ?`,
+							time.Now().Unix(), existingSettings.Hour, existingSettings.Min, existingSettings.Sec, 
+							existingSettings.Daily, existingSettings.Weekly, existingSettings.Monthly, 
+							existingSettings.Dayinweek, existingSettings.Weekinmonth, ispID)
+						return err
+					}
+					
+					// Log the enable/disable action after successful database update
+					if err == nil {
+						clientIP := getClientIP(r)
+						ispName := getISPName(ispID)
+						var logReason string
+						
+						if autorestartValue == 0 {
+							logReason = "[USER ACTION] Auto-restart disabled"
+						} else {
+							// Generate human-readable schedule text for current settings
+							var scheduleType string
+							if existingSettings.Daily == 1 {
+								scheduleType = "daily"
+							} else if existingSettings.Weekly == 1 {
+								scheduleType = "weekly"
+							} else if existingSettings.Monthly == 1 {
+								scheduleType = "monthly"
+							}
+							scheduleText := generateScheduleText(scheduleType, existingSettings.Dayinweek, existingSettings.Hour, existingSettings.Min, existingSettings.Weekinmonth)
+							logReason = fmt.Sprintf("[USER ACTION] Auto-restart enabled - %s", scheduleText)
+						}
+						
+						logErr := logISPRestartAction(db, logReason, ispID, ispName, "autorestart_toggle", 0, clientIP)
+						if logErr != nil {
+							fmt.Printf("[LOG ERROR] Failed to log autorestart toggle: %v\n", logErr)
+						}
+					}
+					return err
+				}, 3, 100*time.Millisecond)
+				
+				if err != nil {
+					logError("Failed to update autorestart settings for ISP %d: %v", ispID, err)
+					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+					return
+				}
+				
+				logInfo("Successfully updated autorestart for ISP %d to %d", ispID, autorestartValue)
+				
+				// Verify the update was successful by querying the database
+				var verifyAutorestart int
+				err = db.QueryRow("SELECT autorestart FROM autorestart WHERE isp_id = ?", ispID).Scan(&verifyAutorestart)
+				if err != nil {
+					logError("Failed to verify autorestart update for ISP %d: %v", ispID, err)
+				} else {
+					logInfo("Database verification: ISP %d autorestart is now %d", ispID, verifyAutorestart)
+				}
+				
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
 				w.WriteHeader(http.StatusOK)
@@ -816,24 +993,71 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				fmt.Fprint(w, "Autorestart updated successfully")
 			} else if dailyRestart {
 				// handle daily restart request here
-				fmt.Println("Received daily restart request with payload:", payload["daily"])
+				logInfo("USER ACTION: Daily restart schedule updated - payload: %v", payload)
 				values := payload["daily"].([]interface{})
+
+				// Extract ISP ID from payload (default to primary ISP if not specified)
+				ispID := 0
+				if ispIDVal, ok := payload["isp_id"]; ok {
+					if ispIDFloat, ok := ispIDVal.(float64); ok {
+						ispID = int(ispIDFloat)
+					}
+				}
 
 				// Ensure you handle the conversion from interface{} to appropriate types.
 				hour, _ := values[0].(float64)
 				minute, _ := values[1].(float64)
 				second, _ := values[2].(float64)
 
-				stmt, err := db.Prepare("UPDATE autorestart SET autorestart=?, hour=?, min=?, sec=?, daily=?, weekly=?, monthly=?, dayinweek=?, weekinmonth=? WHERE ROWID=0")
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer stmt.Close()
+				err := retryDatabaseOperation(func() error {
+					// First ensure the row exists for this ISP
+					var count int
+					err := db.QueryRow("SELECT COUNT(*) FROM autorestart WHERE isp_id = ?", ispID).Scan(&count)
+					if err != nil {
+						return err
+					}
+					
+					if count == 0 {
+						// Row doesn't exist, create it first
+						_, err := db.Exec(`
+							INSERT INTO autorestart 
+							(isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth) 
+							VALUES (?, ?, 1, ?, ?, ?, 1, 0, 0, 0, 0)`,
+							ispID, time.Now().Unix(), int(hour), int(minute), int(second))
+						if err != nil {
+							return fmt.Errorf("failed to create autorestart row for ISP %d: %v", ispID, err)
+						}
+						logInfo("Created daily autorestart schedule for ISP %d at %02d:%02d:%02d", ispID, int(hour), int(minute), int(second))
+					} else {
+						// Row exists, update it
+						_, err := db.Exec(`
+							UPDATE autorestart 
+							SET uxtimesec = ?, autorestart = 1, hour = ?, min = ?, sec = ?, 
+							    daily = 1, weekly = 0, monthly = 0, dayinweek = 0, weekinmonth = 0
+							WHERE isp_id = ?`,
+							time.Now().Unix(), int(hour), int(minute), int(second), ispID)
+						if err != nil {
+							return fmt.Errorf("failed to update daily schedule for ISP %d: %v", ispID, err)
+						}
+						logInfo("Updated daily autorestart schedule for ISP %d at %02d:%02d:%02d", ispID, int(hour), int(minute), int(second))
+					}
+					return nil
+				}, 3, 100*time.Millisecond)
 
-				// Execute the statement with values for the specified columns
-				_, err = stmt.Exec(1, int(hour), int(minute), int(second), 1, 0, 0, 0, 0)
 				if err != nil {
-					log.Fatal(err)
+					logError("Failed to update daily restart schedule for ISP %d: %v", ispID, err)
+					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+					return
+				}
+
+				// Log the custom schedule action
+				clientIP := getClientIP(r)
+				ispName := getISPName(ispID)
+				scheduleText := generateScheduleText("daily", 0, int(hour), int(minute), 0)
+				logReason := fmt.Sprintf("[USER ACTION] Auto-restart schedule set for %s - %s", ispName, scheduleText)
+				logErr := logISPRestartAction(db, logReason, ispID, ispName, "schedule_set", 0, clientIP)
+				if logErr != nil {
+					fmt.Printf("[LOG ERROR] Failed to log schedule action: %v\n", logErr)
 				}
 
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
@@ -844,8 +1068,16 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 
 			} else if weeklyRestart {
 				// handle weekly restart request here
-				fmt.Println("Received weekly restart request with payload:", payload["weekly"])
+				logInfo("USER ACTION: Weekly restart schedule updated - payload: %v", payload)
 				values := payload["weekly"].([]interface{})
+
+				// Extract ISP ID from payload (default to primary ISP if not specified)
+				ispID := 0
+				if ispIDVal, ok := payload["isp_id"]; ok {
+					if ispIDFloat, ok := ispIDVal.(float64); ok {
+						ispID = int(ispIDFloat)
+					}
+				}
 
 				// Ensure you handle the conversion from interface{} to appropriate types.
 				dayinweek, _ := values[0].(float64)
@@ -853,16 +1085,55 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				minute, _ := values[2].(float64)
 				second, _ := values[3].(float64)
 
-				stmt, err := db.Prepare("UPDATE autorestart SET autorestart=?, hour=?, min=?, sec=?, daily=?, weekly=?, monthly=?, dayinweek=?, weekinmonth=? WHERE ROWID=0")
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer stmt.Close()
+				err := retryDatabaseOperation(func() error {
+					// First ensure the row exists for this ISP
+					var count int
+					err := db.QueryRow("SELECT COUNT(*) FROM autorestart WHERE isp_id = ?", ispID).Scan(&count)
+					if err != nil {
+						return err
+					}
+					
+					if count == 0 {
+						// Row doesn't exist, create it first
+						_, err := db.Exec(`
+							INSERT INTO autorestart 
+							(isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth) 
+							VALUES (?, ?, 1, ?, ?, ?, 0, 1, 0, ?, 0)`,
+							ispID, time.Now().Unix(), int(hour), int(minute), int(second), int(dayinweek))
+						if err != nil {
+							return fmt.Errorf("failed to create autorestart row for ISP %d: %v", ispID, err)
+						}
+						logInfo("Created weekly autorestart schedule for ISP %d: day %d at %02d:%02d:%02d", ispID, int(dayinweek), int(hour), int(minute), int(second))
+					} else {
+						// Row exists, update it
+						_, err := db.Exec(`
+							UPDATE autorestart 
+							SET uxtimesec = ?, autorestart = 1, hour = ?, min = ?, sec = ?, 
+							    daily = 0, weekly = 1, monthly = 0, dayinweek = ?, weekinmonth = 0
+							WHERE isp_id = ?`,
+							time.Now().Unix(), int(hour), int(minute), int(second), int(dayinweek), ispID)
+						if err != nil {
+							return fmt.Errorf("failed to update weekly schedule for ISP %d: %v", ispID, err)
+						}
+						logInfo("Updated weekly autorestart schedule for ISP %d: day %d at %02d:%02d:%02d", ispID, int(dayinweek), int(hour), int(minute), int(second))
+					}
+					return nil
+				}, 3, 100*time.Millisecond)
 
-				// Execute the statement with values for the specified columns
-				_, err = stmt.Exec(1, int(hour), int(minute), int(second), 0, 1, 0, int(dayinweek), 0)
 				if err != nil {
-					log.Fatal(err)
+					logError("Failed to update weekly restart schedule for ISP %d: %v", ispID, err)
+					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+					return
+				}
+
+				// Log the custom schedule action
+				clientIP := getClientIP(r)
+				ispName := getISPName(ispID)
+				scheduleText := generateScheduleText("weekly", int(dayinweek), int(hour), int(minute), 0)
+				logReason := fmt.Sprintf("[USER ACTION] Auto-restart schedule set for %s - %s", ispName, scheduleText)
+				logErr := logISPRestartAction(db, logReason, ispID, ispName, "schedule_set", 0, clientIP)
+				if logErr != nil {
+					fmt.Printf("[LOG ERROR] Failed to log schedule action: %v\n", logErr)
 				}
 
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
@@ -873,27 +1144,73 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 
 			} else if monthlyRestart {
 				// handle monthly restart request here
-				fmt.Println("Received monthly restart request with payload:", payload["monthly"])
+				logInfo("USER ACTION: Monthly restart schedule updated - payload: %v", payload)
 				values := payload["monthly"].([]interface{})
 
-				// Ensure you handle the conversion from interface{} to appropriate types.
+				// Extract ISP ID from payload (default to primary ISP if not specified)
+				ispID := 0
+				if ispIDVal, ok := payload["isp_id"]; ok {
+					if ispIDFloat, ok := ispIDVal.(float64); ok {
+						ispID = int(ispIDFloat)
+					}
+				}
 
+				// Ensure you handle the conversion from interface{} to appropriate types.
 				weekinmonth, _ := values[0].(float64)
 				dayinweek, _ := values[1].(float64)
 				hour, _ := values[2].(float64)
 				minute, _ := values[3].(float64)
 				second, _ := values[4].(float64)
 
-				stmt, err := db.Prepare("UPDATE autorestart SET autorestart=?, hour=?, min=?, sec=?, daily=?, weekly=?, monthly=?, dayinweek=?, weekinmonth=? WHERE ROWID=0")
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer stmt.Close()
+				err := retryDatabaseOperation(func() error {
+					// First ensure the row exists for this ISP
+					var count int
+					err := db.QueryRow("SELECT COUNT(*) FROM autorestart WHERE isp_id = ?", ispID).Scan(&count)
+					if err != nil {
+						return err
+					}
+					
+					if count == 0 {
+						// Row doesn't exist, create it first
+						_, err := db.Exec(`
+							INSERT INTO autorestart 
+							(isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth) 
+							VALUES (?, ?, 1, ?, ?, ?, 0, 0, 1, ?, ?)`,
+							ispID, time.Now().Unix(), int(hour), int(minute), int(second), int(dayinweek), int(weekinmonth))
+						if err != nil {
+							return fmt.Errorf("failed to create autorestart row for ISP %d: %v", ispID, err)
+						}
+						logInfo("Created monthly autorestart schedule for ISP %d: week %d, day %d at %02d:%02d:%02d", ispID, int(weekinmonth), int(dayinweek), int(hour), int(minute), int(second))
+					} else {
+						// Row exists, update it
+						_, err := db.Exec(`
+							UPDATE autorestart 
+							SET uxtimesec = ?, autorestart = 1, hour = ?, min = ?, sec = ?, 
+							    daily = 0, weekly = 0, monthly = 1, dayinweek = ?, weekinmonth = ?
+							WHERE isp_id = ?`,
+							time.Now().Unix(), int(hour), int(minute), int(second), int(dayinweek), int(weekinmonth), ispID)
+						if err != nil {
+							return fmt.Errorf("failed to update monthly schedule for ISP %d: %v", ispID, err)
+						}
+						logInfo("Updated monthly autorestart schedule for ISP %d: week %d, day %d at %02d:%02d:%02d", ispID, int(weekinmonth), int(dayinweek), int(hour), int(minute), int(second))
+					}
+					return nil
+				}, 3, 100*time.Millisecond)
 
-				// Execute the statement with values for the specified columns
-				_, err = stmt.Exec(1, int(hour), int(minute), int(second), 0, 0, 1, int(dayinweek), int(weekinmonth))
 				if err != nil {
-					log.Fatal(err)
+					logError("Failed to update monthly restart schedule for ISP %d: %v", ispID, err)
+					http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+					return
+				}
+
+				// Log the custom schedule action
+				clientIP := getClientIP(r)
+				ispName := getISPName(ispID)
+				scheduleText := generateScheduleText("monthly", int(dayinweek), int(hour), int(minute), int(weekinmonth))
+				logReason := fmt.Sprintf("[USER ACTION] Auto-restart schedule set for %s - %s", ispName, scheduleText)
+				logErr := logISPRestartAction(db, logReason, ispID, ispName, "schedule_set", 0, clientIP)
+				if logErr != nil {
+					fmt.Printf("[LOG ERROR] Failed to log schedule action: %v\n", logErr)
 				}
 
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
@@ -910,7 +1227,7 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				rows, err := db.Query("SELECT uxtimesec, cloudflare, google, facebook, x FROM pings ORDER BY uxtimesec DESC LIMIT ?", payload["Rows"])
 				if err != nil {
 					logError("Failed to query ping data: %v", err)
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+					corsError(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
 				defer rows.Close()
@@ -922,7 +1239,7 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					err = rows.Scan(&data.Untimesec, &data.Cloudflare, &data.Google, &data.Facebook, &data.X)
 					if err != nil {
 						logError("Failed to scan ping row: %v", err)
-						http.Error(w, err.Error(), http.StatusInternalServerError)
+						corsError(w, err.Error(), http.StatusInternalServerError)
 						return
 					}
 					pingResults = append(pingResults, data)
@@ -977,6 +1294,10 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					return
 				}
 
+				// Get client IP address and ISP name for logging
+				clientIP := getClientIP(r)
+				ispName := getISPName(int(ispID))
+
 				currentTime := time.Now().Unix()
 				logInfo("Updating ISP %d for immediate restart - setting powerstate=0, uxtimewhenoffrequested=%d", int(ispID), currentTime)
 
@@ -998,7 +1319,14 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					return
 				}
 
-				fmt.Printf("[DATABASE] Successfully updated ISP %d for immediate restart\n", int(ispID))
+				// Log the custom restart action
+				logReason := fmt.Sprintf("[USER ACTION] ISP restart requested by user from %s", clientIP)
+				logErr := logISPRestartAction(db, logReason, int(ispID), ispName, "restart_now", 0, clientIP)
+				if logErr != nil {
+					fmt.Printf("[LOG ERROR] Failed to log ISP restart action: %v\n", logErr)
+				}
+
+				fmt.Printf("[DATABASE] Successfully updated ISP %d (%s) for immediate restart by %s\n", int(ispID), ispName, clientIP)
 
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "text/plain")
@@ -1021,6 +1349,10 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					http.Error(w, "Invalid restartfor format", http.StatusBadRequest)
 					return
 				}
+
+				// Get client IP address and ISP name for logging
+				clientIP := getClientIP(r)
+				ispName := getISPName(int(ispID))
 
 				currentTime := time.Now().Unix()
 				offUntilTime := currentTime + (int64(durationMinutes) * 60) // Convert minutes to seconds
@@ -1045,7 +1377,14 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 					return
 				}
 
-				fmt.Printf("[DATABASE] Successfully updated ISP %d for timed restart\n", int(ispID))
+				// Log the custom restart action
+				logReason := fmt.Sprintf("[USER ACTION] ISP timed restart (%.0f minutes) requested by user from %s", durationMinutes, clientIP)
+				logErr := logISPRestartAction(db, logReason, int(ispID), ispName, "restart_for_duration", int(durationMinutes), clientIP)
+				if logErr != nil {
+					fmt.Printf("[LOG ERROR] Failed to log ISP restart action: %v\n", logErr)
+				}
+
+				fmt.Printf("[DATABASE] Successfully updated ISP %d (%s) for timed restart (%.0f minutes) by %s\n", int(ispID), ispName, durationMinutes, clientIP)
 
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "text/plain")
@@ -1067,23 +1406,50 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 			logsQuery := params.Get("logs")
 
 			if autorestartQuery != "" {
-				// Handle get request for button state request data
-				fmt.Printf("[DATABASE] Querying autorestart settings from autorestart table\n")
+				// Handle get request for button state request data for both ISPs
+				fmt.Printf("[DATABASE] Querying autorestart settings from autorestart table for both ISPs\n")
 				
-				var autorestart Autorestart
-				err := db.QueryRow("SELECT ROWID, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth FROM autorestart WHERE ROWID = 0").
-					Scan(&autorestart.ROWID, &autorestart.Uxtimesec, &autorestart.Autorestart, &autorestart.Hour, &autorestart.Min, &autorestart.Sec, &autorestart.Daily, &autorestart.Weekly, &autorestart.Monthly, &autorestart.Dayinweek, &autorestart.Weekinmonth)
+				var primaryAutorestart, secondaryAutorestart Autorestart
+				
+				// Query primary ISP (isp_id 0)
+				err := db.QueryRow("SELECT isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth FROM autorestart WHERE isp_id = 0").
+					Scan(&primaryAutorestart.ROWID, &primaryAutorestart.Uxtimesec, &primaryAutorestart.Autorestart, &primaryAutorestart.Hour, &primaryAutorestart.Min, &primaryAutorestart.Sec, &primaryAutorestart.Daily, &primaryAutorestart.Weekly, &primaryAutorestart.Monthly, &primaryAutorestart.Dayinweek, &primaryAutorestart.Weekinmonth)
 				if err != nil {
-					fmt.Printf("[DATABASE ERROR] Failed to query autorestart settings: %v\n", err)
-					http.Error(w, fmt.Sprintf("Error fetching autorestart: %v", err), http.StatusInternalServerError)
-					return
+					if err == sql.ErrNoRows {
+						fmt.Printf("[DATABASE WARNING] Primary ISP autorestart settings (isp_id=0) not found, creating defaults\n")
+						primaryAutorestart = Autorestart{ROWID: 0, Autorestart: 0}
+					} else {
+						fmt.Printf("[DATABASE ERROR] Failed to query primary autorestart settings: %v\n", err)
+						http.Error(w, fmt.Sprintf("Error fetching primary autorestart: %v", err), http.StatusInternalServerError)
+						return
+					}
 				}
 				
-				fmt.Printf("[DATABASE] Successfully retrieved autorestart settings: enabled=%d, schedule=%02d:%02d:%02d\n", autorestart.Autorestart, autorestart.Hour, autorestart.Min, autorestart.Sec)
+				// Query secondary ISP (isp_id 1)
+				err = db.QueryRow("SELECT isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth FROM autorestart WHERE isp_id = 1").
+					Scan(&secondaryAutorestart.ROWID, &secondaryAutorestart.Uxtimesec, &secondaryAutorestart.Autorestart, &secondaryAutorestart.Hour, &secondaryAutorestart.Min, &secondaryAutorestart.Sec, &secondaryAutorestart.Daily, &secondaryAutorestart.Weekly, &secondaryAutorestart.Monthly, &secondaryAutorestart.Dayinweek, &secondaryAutorestart.Weekinmonth)
+				if err != nil {
+					if err == sql.ErrNoRows {
+						fmt.Printf("[DATABASE WARNING] Secondary ISP autorestart settings (isp_id=1) not found, creating defaults\n")
+						secondaryAutorestart = Autorestart{ROWID: 1, Autorestart: 0}
+					} else {
+						fmt.Printf("[DATABASE ERROR] Failed to query secondary autorestart settings: %v\n", err)
+						http.Error(w, fmt.Sprintf("Error fetching secondary autorestart: %v", err), http.StatusInternalServerError)
+						return
+					}
+				}
+				
+				fmt.Printf("[DATABASE] Successfully retrieved autorestart settings - Primary: enabled=%d, Secondary: enabled=%d\n", primaryAutorestart.Autorestart, secondaryAutorestart.Autorestart)
+				
+				// Return both ISP settings
+				response := map[string]interface{}{
+					"primary": primaryAutorestart,
+					"secondary": secondaryAutorestart,
+				}
 				
 				w.Header().Set("Access-Control-Allow-Origin", "*") // Include this header for all responses
 				w.Header().Set("Content-Type", "application/json") // Include this header for JSON responses
-				json.NewEncoder(w).Encode(autorestart)
+				json.NewEncoder(w).Encode(response)
 			} else if ispStatesQuery != "" {
 				// Handle ISP states request (most frequent - only log at TRACE level)
 				logTrace("Querying ISP states")
@@ -1177,7 +1543,7 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				
 				fmt.Printf("[DATABASE] Querying activity logs from logs table - Requesting %d most recent entries\n", limit)
 				
-				rows, err := db.Query("SELECT uxtimesec, reason FROM logs ORDER BY uxtimesec DESC LIMIT ?", limit)
+				rows, err := db.Query("SELECT uxtimesec, reason, isp_id, isp_name, restart_type, duration_minutes, client_ip FROM logs ORDER BY uxtimesec DESC LIMIT ?", limit)
 				if err != nil {
 					fmt.Printf("[DATABASE ERROR] Failed to query logs: %v\n", err)
 					http.Error(w, fmt.Sprintf("Error fetching logs: %v", err), http.StatusInternalServerError)
@@ -1188,11 +1554,37 @@ func pingDataHandler(db *sql.DB) func(http.ResponseWriter, *http.Request) { //im
 				logs := make([]Log, 0)
 				for rows.Next() {
 					var log Log
-					err = rows.Scan(&log.Uxtimesec, &log.Reason)
+					var ispID sql.NullInt64
+					var ispName sql.NullString
+					var restartType sql.NullString
+					var durationMinutes sql.NullInt64
+					var clientIP sql.NullString
+					
+					err = rows.Scan(&log.Uxtimesec, &log.Reason, &ispID, &ispName, &restartType, &durationMinutes, &clientIP)
 					if err != nil {
 						fmt.Printf("[DATABASE ERROR] Failed to scan log row: %v\n", err)
 						continue
 					}
+					
+					// Convert nullable fields to pointers
+					if ispID.Valid {
+						val := int(ispID.Int64)
+						log.IspID = &val
+					}
+					if ispName.Valid {
+						log.IspName = &ispName.String
+					}
+					if restartType.Valid {
+						log.RestartType = &restartType.String
+					}
+					if durationMinutes.Valid {
+						val := int(durationMinutes.Int64)
+						log.DurationMinutes = &val
+					}
+					if clientIP.Valid {
+						log.ClientIP = &clientIP.String
+					}
+					
 					logs = append(logs, log)
 				}
 				
@@ -1226,6 +1618,12 @@ func configureDatabase(db *sql.DB) error {
 		return fmt.Errorf("failed to set synchronous mode: %v", err)
 	}
 
+	// Set WAL auto-checkpoint to prevent infinite growth
+	_, err = db.Exec("PRAGMA wal_autocheckpoint=1000") // Checkpoint every 1000 pages
+	if err != nil {
+		return fmt.Errorf("failed to set WAL autocheckpoint: %v", err)
+	}
+
 	// Configure connection pooling for optimal concurrency (reduced for less overhead)
 	db.SetMaxOpenConns(5)                   // Reduced from 10 to 5
 	db.SetMaxIdleConns(2)                   // Reduced from 5 to 2
@@ -1233,6 +1631,22 @@ func configureDatabase(db *sql.DB) error {
 
 	fmt.Println("Database configured for concurrency with optimized WAL mode")
 	return nil
+}
+
+// periodicWALCheckpoint runs a WAL checkpoint every 5 minutes to prevent infinite WAL growth
+func periodicWALCheckpoint(db *sql.DB) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		// Perform manual WAL checkpoint
+		_, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		if err != nil {
+			logError("Failed to perform WAL checkpoint: %v", err)
+		} else {
+			logTrace("WAL checkpoint completed successfully")
+		}
+	}
 }
 
 func createTables(db *sql.DB) error {
@@ -1248,7 +1662,8 @@ func createTables(db *sql.DB) error {
 
 	_, err1 := db.Exec(`
         CREATE TABLE IF NOT EXISTS autorestart (
-            uxtimesec INTEGER PRIMARY KEY,
+            isp_id TINYINT PRIMARY KEY,
+            uxtimesec INTEGER NOT NULL,
 			autorestart TINYINT NOT NULL,
 			hour TINYINT NOT NULL,
 			min TINYINT NOT NULL,
@@ -1264,7 +1679,12 @@ func createTables(db *sql.DB) error {
 	_, err2 := db.Exec(`
         CREATE TABLE IF NOT EXISTS logs (
             uxtimesec INTEGER PRIMARY KEY,
-            reason TEXT NOT NULL
+            reason TEXT NOT NULL,
+            isp_id INTEGER,
+            isp_name TEXT,
+            restart_type TEXT,
+            duration_minutes INTEGER,
+            client_ip TEXT
         );
     `)
 
@@ -1343,45 +1763,53 @@ func pingTest(pingResults chan map[string]int) {
 	}
 
 	ticker := time.NewTicker(15 * time.Second)
+	
+	// Initial ping test immediately on startup
+	fmt.Printf("[PING] Starting initial ping test...\n")
+	
+	for {
+		select {
+		case <-ticker.C:
+			fmt.Printf("[PING] Running ping test cycle...\n")
+			results := make(map[string]int)
 
-	for range ticker.C {
-		results := make(map[string]int)
+			for website, ip := range pingThese {
+				fmt.Printf("[PING] Testing %s (%s)...\n", website, ip)
+				var cmd *exec.Cmd
+				
+				// Detect OS and use appropriate ping command
+				if runtime.GOOS == "windows" {
+					cmd = exec.Command("ping", "-n", "1", ip) // Windows uses -n for count
+				} else {
+					cmd = exec.Command("ping", "-c", "1", ip) // Linux/Mac use -c for count
+				}
 
-		for website, ip := range pingThese {
-			var cmd *exec.Cmd
-			
-			// Detect OS and use appropriate ping command
-			if runtime.GOOS == "windows" {
-				cmd = exec.Command("ping", "-n", "1", ip) // Windows uses -n for count
-			} else {
-				cmd = exec.Command("ping", "-c", "1", ip) // Linux/Mac use -c for count
-			}
-
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				results[website] = -1
-				continue
-			}
-			//log.Println(string(output))
-			
-			// Parse ping output based on OS
-			var latency float64
-			var found bool
-			
-			if runtime.GOOS == "windows" {
-				// Windows format: "Reply from x.x.x.x: bytes=32 time=10ms TTL=64"
-				lines := strings.Split(string(output), "\n")
-				for _, line := range lines {
-					if strings.Contains(line, "time=") && strings.Contains(line, "ms") {
-						// Extract time value
-						parts := strings.Split(line, "time=")
-						if len(parts) > 1 {
-							timePart := strings.Split(parts[1], "ms")[0]
-							timePart = strings.TrimSpace(timePart)
-							// Handle "<1" case for very low latencies
-							if strings.Contains(timePart, "<") {
-								latency = 1.0
-								found = true
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					fmt.Printf("[PING] Error pinging %s: %v\n", website, err)
+					results[website] = -1
+					continue
+				}
+				//log.Println(string(output))
+				
+				// Parse ping output based on OS
+				var latency float64
+				var found bool
+				
+				if runtime.GOOS == "windows" {
+					// Windows format: "Reply from x.x.x.x: bytes=32 time=10ms TTL=64"
+					lines := strings.Split(string(output), "\n")
+					for _, line := range lines {
+						if strings.Contains(line, "time=") && strings.Contains(line, "ms") {
+							// Extract time value
+							parts := strings.Split(line, "time=")
+							if len(parts) > 1 {
+								timePart := strings.Split(parts[1], "ms")[0]
+								timePart = strings.TrimSpace(timePart)
+								// Handle "<1" case for very low latencies
+								if strings.Contains(timePart, "<") {
+									latency = 1.0
+									found = true
 							} else {
 								if val, err := strconv.ParseFloat(timePart, 64); err == nil {
 									latency = val
@@ -1433,48 +1861,48 @@ func pingTest(pingResults chan map[string]int) {
 			}
 		}
 
-		pingResults <- results
+			fmt.Printf("[PING] Completed ping cycle, sending results\n")
+			pingResults <- results
+		}
 	}
 }
 
 func retriveSettings(db *sql.DB) {
-	// query the database for the autorestart table
-	// check the table for a any amount of rows, if it has more than 0 rows, then retrieve the values
-	// if it has 0 rows, then insert the default values
-
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM autorestart").Scan(&count)
+	// Initialize autorestart table with default rows for both ISPs if they don't exist
+	err := initializeAutorestartTable(db)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("Error initializing autorestart table: %v\n", err)
 		return
 	}
+}
 
-	if count > 0 {
-		//"Table is not empty" - lets retrieve the values
-		fmt.Println("Table is not empty, retrieving values")
-		var uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth int
-
-		err = db.QueryRow("SELECT uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth FROM autorestart").Scan(&uxtimesec, &autorestart, &hour, &min, &sec, &daily, &weekly, &monthly, &dayinweek, &weekinmonth)
-		if err != nil {
-			log.Fatal(err)
+func initializeAutorestartTable(db *sql.DB) error {
+	return retryDatabaseOperation(func() error {
+		// Check if both required rows exist (isp_id 0 for primary, isp_id 1 for secondary)
+		for ispID := 0; ispID <= 1; ispID++ {
+			var count int
+			err := db.QueryRow("SELECT COUNT(*) FROM autorestart WHERE isp_id = ?", ispID).Scan(&count)
+			if err != nil {
+				return fmt.Errorf("error checking for ISP %d autorestart row: %v", ispID, err)
+			}
+			
+			if count == 0 {
+				// Insert default row for this ISP (autorestart disabled by default)
+				_, err = db.Exec(`
+					INSERT INTO autorestart 
+					(isp_id, uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth) 
+					VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
+					ispID, time.Now().Unix())
+				if err != nil {
+					return fmt.Errorf("error inserting default autorestart row for ISP %d: %v", ispID, err)
+				}
+				fmt.Printf("Initialized autorestart table with default values for ISP %d (disabled)\n", ispID)
+			} else {
+				fmt.Printf("Autorestart row for ISP %d already exists\n", ispID)
+			}
 		}
-		fmt.Printf("Retrieved values: uxtimesec=%d, autorestart=%d, hour=%d, min=%d, sec=%d, daily=%d, weekly=%d, monthly=%d, dayinweek=%d, weekinmonth=%d\n", uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth)
-
-	} else {
-		//"Table is empty" - lets populate it with default values
-		fmt.Println("Table is empty, inserting default values")
-		stmt, err := db.Prepare("INSERT INTO autorestart (uxtimesec, autorestart, hour, min, sec, daily, weekly, monthly, dayinweek, weekinmonth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer stmt.Close()
-
-		_, err = stmt.Exec(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
+		return nil
+	}, 3, 200*time.Millisecond)
 }
 
 // Monitor network status and update database
@@ -1601,6 +2029,89 @@ func logEvent(db *sql.DB, reason string) error {
 		_, err := db.Exec("INSERT INTO logs (uxtimesec, reason) VALUES (?, ?)", currentTime, reason)
 		return err
 	}, 3, 100*time.Millisecond)
+}
+
+// Log an ISP restart action with detailed information
+func logISPRestartAction(db *sql.DB, reason string, ispID int, ispName string, restartType string, durationMinutes int, clientIP string) error {
+	currentTime := time.Now().Unix()
+	
+	return retryDatabaseOperation(func() error {
+		_, err := db.Exec("INSERT INTO logs (uxtimesec, reason, isp_id, isp_name, restart_type, duration_minutes, client_ip) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+			currentTime, reason, ispID, ispName, restartType, durationMinutes, clientIP)
+		return err
+	}, 3, 100*time.Millisecond)
+}
+
+// Generate human-readable schedule text for logging
+func generateScheduleText(scheduleType string, dayinweek int, hour int, minute int, weekinmonth int) string {
+	dayNames := map[int]string{
+		1: "Sunday", 2: "Monday", 3: "Tuesday", 4: "Wednesday",
+		5: "Thursday", 6: "Friday", 7: "Saturday",
+	}
+	
+	weekNames := map[int]string{
+		1: "first", 2: "second", 3: "third", 4: "fourth",
+	}
+	
+	timeStr := fmt.Sprintf("%02d:%02d", hour, minute)
+	
+	switch scheduleType {
+	case "daily":
+		return fmt.Sprintf("daily at %s", timeStr)
+	case "weekly":
+		dayName := dayNames[dayinweek]
+		if dayName == "" {
+			dayName = fmt.Sprintf("day %d", dayinweek)
+		}
+		return fmt.Sprintf("weekly every %s at %s", dayName, timeStr)
+	case "monthly":
+		dayName := dayNames[dayinweek]
+		if dayName == "" {
+			dayName = fmt.Sprintf("day %d", dayinweek)
+		}
+		weekName := weekNames[weekinmonth]
+		if weekName == "" {
+			weekName = fmt.Sprintf("week %d", weekinmonth)
+		}
+		return fmt.Sprintf("monthly on the %s %s at %s", weekName, dayName, timeStr)
+	default:
+		return fmt.Sprintf("at %s", timeStr)
+	}
+}
+
+// Get client IP address from HTTP request
+func getClientIP(r *http.Request) string {
+	// Check for forwarded header first (if behind proxy)
+	forwarded := r.Header.Get("X-Forwarded-For")
+	if forwarded != "" {
+		// X-Forwarded-For can contain multiple IPs, get the first one
+		parts := strings.Split(forwarded, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	
+	// Check for real IP header (Cloudflare, etc.)
+	realIP := r.Header.Get("X-Real-IP")
+	if realIP != "" {
+		return realIP
+	}
+	
+	// Fall back to remote address
+	ip := r.RemoteAddr
+	// Remove port if present
+	if idx := strings.LastIndex(ip, ":"); idx != -1 {
+		ip = ip[:idx]
+	}
+	return ip
+}
+
+// Get ISP name from ISP ID
+func getISPName(ispID int) string {
+	if ispID == 0 {
+		return "Primary (T-Mobile)"
+	} else if ispID == 1 {
+		return "Secondary (Mercury)"
+	}
+	return "Unknown"
 }
 
 // Interactive command-line interface for testing ISP state changes
