@@ -39,8 +39,13 @@ func (cache *ISPStateCache) isStale(maxAge time.Duration) bool {
 // Terminal control functions
 func initTerminal() {
 	if runtime.GOOS == "windows" {
-		// On Windows, try to enable ANSI escape sequences
-		// This may not work on older Windows versions
+		// On Windows, use simple mode
+		console.terminalMode = false
+		return
+	}
+	
+	// Check if we're in an interactive terminal
+	if !isInteractiveTerminal() {
 		console.terminalMode = false
 		return
 	}
@@ -61,13 +66,25 @@ func initTerminal() {
 	console.terminalMode = true
 	console.needsRedraw = true
 	
-	// Enable alternative screen buffer and hide cursor
-	fmt.Print("\033[?1049h\033[?25l")
+	// Use simple clear screen instead of alternative buffer
+	fmt.Print("\033[2J\033[H\033[?25l") // Clear screen, move to home, hide cursor
 	
 	// Set up signal handler for cleanup
 	setupSignalHandler()
 	
 	redrawTerminal()
+}
+
+func isInteractiveTerminal() bool {
+	// Check if stdout is a terminal (not redirected)
+	if fileInfo, _ := os.Stdout.Stat(); (fileInfo.Mode() & os.ModeCharDevice) == 0 {
+		return false
+	}
+	// Check if stdin is a terminal  
+	if fileInfo, _ := os.Stdin.Stat(); (fileInfo.Mode() & os.ModeCharDevice) == 0 {
+		return false
+	}
+	return true
 }
 
 func getTerminalSize() (height, width int) {
@@ -123,8 +140,8 @@ func setupSignalHandler() {
 
 func cleanupTerminal() {
 	if console.terminalMode {
-		// Show cursor and restore normal screen buffer
-		fmt.Print("\033[?25h\033[?1049l")
+		// Show cursor and clear screen
+		fmt.Print("\033[?25h\033[2J\033[H")
 	}
 }
 

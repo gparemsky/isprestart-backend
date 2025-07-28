@@ -62,7 +62,13 @@ func main() {
 	logInfo("Server listening on port 8081")
 	logInfo("Command interface available - type 'help' for commands")
 	logInfo("Default log level: %s (use 'loglevel <level>' to change)", logLevelNames[console.logLevel])
-	http.ListenAndServe(":8081", nil)
+	
+	// Start HTTP server in a goroutine so it doesn't block
+	go func() {
+		if err := http.ListenAndServe(":8081", nil); err != nil {
+			logError("Failed to start HTTP server: %v", err)
+		}
+	}()
 
 	select {} // keep the program running
 }
